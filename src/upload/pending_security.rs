@@ -33,7 +33,14 @@ pub(crate) struct PrivateDirectory {
 
 impl PartialEq for PrivateDirectory {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.snapshot().ok() == other.snapshot().ok()
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return true;
+        }
+        self.path == other.path
+            && matches!(
+                (self.snapshot(), other.snapshot()),
+                (Ok(left), Ok(right)) if left == right
+            )
     }
 }
 
