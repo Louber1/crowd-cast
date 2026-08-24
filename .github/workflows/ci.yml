@@ -15,6 +15,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -34,22 +37,29 @@ jobs:
   check:
     name: cargo check (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: macOS
-            os: macos-latest
+            os: macos-15
           - name: Windows
-            os: windows-latest
+            os: windows-2025
           - name: Linux
             os: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@839ed2261f110eedd370cb037b6038e074512c4e # 1.91.0
+        with:
+          components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-targets: false
 
       # Linux builds compile the GTK3 setup wizard (src/ui/wizard_linux.c) and
       # probe GTK via pkg-config in build.rs, so the dev headers must be present.
@@ -61,19 +71,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libgtk-3-dev
+          dpkg-query -W -f='${Package}=${Version}\n' \
+            build-essential pkg-config libgtk-3-dev
 
       # The libobs crate vendors OBS headers that #include <simde/x86/sse2.h>. On dev/release
       # machines simde is already present (pulled in with OBS); a clean macOS runner needs it
       # installed and added to bindgen's clang include path.
       - name: Install simde headers (macOS libobs bindgen)
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-15'
         run: |
           brew install simde
+          brew info --json=v2 simde
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I$(brew --prefix)/include" >> "$GITHUB_ENV"
 
-      # Pure compile gate: `cargo check` typechecks each platform's cfg code without
-      # linking, so it needs no libobs binaries/bundle. The unit tests link the binary
-      # (requiring provisioned OBS per platform) and are run locally + in the release
-      # pipelines, so they are intentionally out of scope here.
+      - name: Record hosted runner image
+        shell: bash
+        run: |
+          : "${ImageOS:?hosted runner did not report ImageOS}"
+          : "${ImageVersion:?hosted runner did not report ImageVersion}"
+          printf 'runner_image=%s/%s\n' "$ImageOS" "$ImageVersion"
+
+      - name: Record toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustfmt --version
+          cargo clippy --version
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: cargo fmt
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
+
       - name: cargo check
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --all-features --locked --offline
