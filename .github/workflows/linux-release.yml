@@ -1,216 +1,403 @@
 name: Linux Release
 
-# Manual trigger (Actions tab → "Run workflow", or `gh workflow run linux-release.yml`).
-# Marketing version comes from Cargo.toml. The AUTO build number (github.run_number) makes
-# same-version rebuilds strictly newer to the in-app updater (is_newer in
-# src/ui/updater_linux.rs compares version, then build number). For a new public marketing version,
-# bump Cargo.toml; Linux binaries report CARGO_PKG_VERSION at runtime, so the appcast version must
-# match it.
-#
-# The Linux updater fetches a SIGNED JSON manifest ("appcast-linux.json" + .sig) — the Linux analog
-# of the mac/win Sparkle appcast. It is published to the SAME S3 bucket as appcast.xml/appcast-win.xml
-# and signed with the SAME Ed25519 key (CROWD_CAST_ED_PRIVATE_KEY); the public half is baked into the
-# binary as CROWD_CAST_UPDATE_PUBKEY. See docs and scripts/release-linux.sh.
 on:
   workflow_dispatch:
     inputs:
       channel:
-        description: "Release channel (dev = isolated feed + pre-release + test upload prefix)"
+        description: Release authority and isolated update feed
         type: choice
         options: [dev, prod]
-        default: dev          # safe default: an accidental dispatch goes to dev, never prod
-      version_base:
-        description: "Marketing version (blank = Cargo.toml version; must match Cargo.toml on Linux)"
-        required: false
-        default: ""
+        default: dev
 
 permissions:
-  contents: write   # create the GitHub Release
+  contents: write
+  id-token: write
+
+concurrency:
+  group: linux-release-${{ inputs.channel }}
+  cancel-in-progress: false
 
 env:
-  OBS_ABI: "32.0.2"
-  S3_BUCKET: "crowd-cast-bucket"
-  # The feed is computed per channel in "Resolve versions": prod → appcast-linux.json (next to the
-  # mac/win appcasts), dev → appcast-linux-dev.json (isolated, mirrors mac's appcast-dev.xml). Both
-  # are fixed, mutable URLs clients poll; the matching URL is baked into the binary below.
-  # The libobs bundle is an ARTIFACT hosted in its own per-ABI Release `obs-bundle-<abi>` (NOT S3,
-  # NOT re-uploaded per release). TODO(ops): publish it once:
-  #   gh release create obs-bundle-32.0.2 packaging/linux/out/obs-bundle-32.0.2-x86_64.tar.zst
-  # The libobs bundle is an ARTIFACT, so it lives in GitHub Releases (like the mac DMG / win .exe),
-  # NOT S3 — S3 only holds the feed. It's published once per ABI as its own Release `obs-bundle-<abi>`
-  # (the from-source build is 30-60 min and changes only on an ABI bump), so binary-only releases
-  # neither rebuild nor re-upload it; the manifest just points users at that stable per-ABI URL.
-  # TODO(ops): publish it once with `packaging/linux/run-build.sh` then
-  #   gh release create obs-bundle-32.0.2 packaging/linux/out/obs-bundle-32.0.2-x86_64.tar.zst
+  S3_BUCKET: crowd-cast-bucket
+  AWS_REGION: us-east-1
 
 jobs:
   release:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment:
+      name: crowd-cast-linux-${{ inputs.channel }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      # No host Rust toolchain: both the agent and the signer are built inside the AlmaLinux 9
-      # container (glibc floor + GTK3 + baked env), so the runner needs only Docker + awscli + python3.
-
-      - name: Resolve versions
-        id: ver
+      - name: Verify dispatch, source, and release authority
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_RUNNER_IMAGE_VERSION: ${{ vars.LINUX_RUNNER_IMAGE_VERSION }}
+          APPROVED_LIBOBS_REVISION: ${{ vars.APPROVED_LIBOBS_REVISION }}
         run: |
-          cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          base="${{ github.event.inputs.version_base }}"
-          [ -z "$base" ] && base="$cargo_ver"
-          if [ "$base" != "$cargo_ver" ]; then
-            echo "::error::Linux appcast version ($base) must match Cargo.toml version ($cargo_ver); bump Cargo.toml instead of overriding version_base."
+          set -euo pipefail
+          [[ '${{ github.run_attempt }}' == 1 ]] || { echo 'Release reruns are forbidden; dispatch a new monotonic build.' >&2; exit 1; }
+          [[ -n "$EXPECTED_RUNNER_IMAGE_VERSION" ]] || { echo 'LINUX_RUNNER_IMAGE_VERSION is required.' >&2; exit 1; }
+          [[ "$ImageVersion" == "$EXPECTED_RUNNER_IMAGE_VERSION" ]] \
+            || { echo "Hosted runner image drift: expected $EXPECTED_RUNNER_IMAGE_VERSION, got $ImageVersion." >&2; exit 1; }
+          [[ "$(git rev-parse HEAD)" == '${{ github.sha }}' ]] || { echo 'Checkout identity mismatch.' >&2; exit 1; }
+          [[ -z "$(git status --porcelain)" ]] || { echo 'Release checkout is not clean.' >&2; exit 1; }
+
+          [[ '${{ github.ref }}' == refs/heads/main ]] || { echo 'Release dispatch requires refs/heads/main.' >&2; exit 1; }
+          remote_main="$(git ls-remote origin refs/heads/main | cut -f1)"
+          [[ "$remote_main" == '${{ github.sha }}' ]] || { echo "Release SHA is not current remote main: $remote_main" >&2; exit 1; }
+          gh api 'repos/${{ github.repository }}/environments/crowd-cast-linux-${{ inputs.channel }}' > "$RUNNER_TEMP/environment.json"
+          gh api 'repos/${{ github.repository }}/immutable-releases' > "$RUNNER_TEMP/immutable-releases.json"
+          python3 - "$RUNNER_TEMP/environment.json" <<'PY'
+          import json, sys
+          environment = json.load(open(sys.argv[1], encoding="utf-8"))
+          if not environment.get("protection_rules"):
+              raise SystemExit("release environment has no protection rules")
+          policy = environment.get("deployment_branch_policy") or {}
+          if not policy.get("protected_branches"):
+              raise SystemExit("release environment must require protected branches")
+          PY
+          python3 - "$RUNNER_TEMP/immutable-releases.json" <<'PY'
+          import json, sys
+          if json.load(open(sys.argv[1], encoding="utf-8")).get("enabled") is not True:
+              raise SystemExit("repository immutable releases are not enabled")
+          PY
+
+          [[ "$APPROVED_LIBOBS_REVISION" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo 'APPROVED_LIBOBS_REVISION must be the independently accepted commit.' >&2; exit 1; }
+          python3 - "$APPROVED_LIBOBS_REVISION" <<'PY'
+          import pathlib, re, sys
+          approved = sys.argv[1]
+          cargo = pathlib.Path("Cargo.toml").read_text(encoding="utf-8")
+          lines = [line for line in cargo.splitlines() if re.match(r"^(libobs|libobs-wrapper|libobs-simple|libobs-bootstrapper|cargo-obs-build)\s*=", line)]
+          if len(lines) < 4:
+              raise SystemExit("expected libobs dependencies are missing")
+          revisions = []
+          for line in lines:
+              match = re.search(r'rev\s*=\s*"([0-9a-f]{40})"', line)
+              if not match:
+                  raise SystemExit(f"mutable libobs dependency: {line}")
+              revisions.append(match.group(1))
+          if set(revisions) != {approved}:
+              raise SystemExit("Cargo libobs pins do not equal the independently approved revision")
+          PY
+          ! rg -n 'cargo_obs_build::install|ObsBootstrapperOptions::default|set_update\(' build.rs src/capture/context.rs \
+            || { echo 'OBS installation is not bound to one application manifest.' >&2; exit 1; }
+          ! rg -n 'falling back to a system OBS|CROWD_CAST_OBS_(DATA|PLUGIN)' src/capture/context.rs \
+            || { echo 'Linux still permits an unbound OBS runtime fallback.' >&2; exit 1; }
+          rg -q 'CROWD_CAST_OBS_BUNDLE_MANIFEST_SHA256' src/capture/context.rs \
+            || { echo 'Linux runtime does not bind an exact native manifest.' >&2; exit 1; }
+          rg -q 'libobs-bootstrap-receipt-v1' src/capture/context.rs \
+            || { echo 'Linux runtime does not require the native install receipt.' >&2; exit 1; }
+          ! rg -n '"\$ENGINE" build|placeholder.invalid|CROWD_CAST_OBS_ABI:-' packaging/linux/run-build-binary.sh packaging/linux/build-binary.sh \
+            || { echo 'Linux builder retains mutable or placeholder inputs.' >&2; exit 1; }
+          echo 'Linux release is blocked until a signed or read-only package authorizes the exact OBS closure before the dynamic loader resolves DT_NEEDED libobs; an in-process receipt cannot authorize a user-writable pre-main library.' >&2
+          exit 1
+
+      - name: Record exact runner tools
+        run: |
+          set -euo pipefail
+          docker version
+          gh --version
+          aws --version
+          python3 --version
+
+      - name: Read back exact native bundle manifest and archive
+        id: native
+        env:
+          MANIFEST_URL: ${{ vars.CROWD_CAST_OBS_BUNDLE_MANIFEST_URL }}
+          MANIFEST_SHA256: ${{ vars.CROWD_CAST_OBS_BUNDLE_MANIFEST_SHA256 }}
+          APPROVED_LIBOBS_REVISION: ${{ vars.APPROVED_LIBOBS_REVISION }}
+        run: |
+          set -euo pipefail
+          [[ "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo 'Native manifest SHA-256 is not canonical.' >&2; exit 1; }
+          python3 - "$MANIFEST_URL" <<'PY'
+          import sys, urllib.parse
+          value = sys.argv[1]
+          if not value.isascii() or any(ord(character) <= 32 or ord(character) == 127 for character in value):
+              raise SystemExit("native manifest URL contains forbidden characters")
+          url = urllib.parse.urlsplit(value)
+          if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment or url.geturl() != value:
+              raise SystemExit("native manifest URL must be exact HTTPS without credentials, query, or fragment")
+          PY
+          manifest="$RUNNER_TEMP/obs-bundle-manifest.json"
+          curl --disable --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --max-filesize 1048576 \
+            --connect-timeout 10 --max-time 120 --output "$manifest" "$MANIFEST_URL"
+          summary="$RUNNER_TEMP/obs-bundle-summary.json"
+          scripts/verify-obs-bundle-manifest.py \
+            --manifest "$manifest" \
+            --manifest-sha256 "$MANIFEST_SHA256" \
+            --platform linux \
+            --arch x86_64 \
+            --approved-libobs-revision "$APPROVED_LIBOBS_REVISION" \
+            --summary-out "$summary"
+          mapfile -t native < <(python3 - "$summary" <<'PY'
+          import json, sys
+          summary = json.load(open(sys.argv[1], encoding="utf-8"))
+          for key in ("bundle_url", "bundle_sha256", "bundle_size", "obs_abi", "implementation_id"):
+              print(summary[key])
+          PY
+          )
+          [[ "${#native[@]}" -eq 5 ]] || { echo 'Native manifest extraction failed.' >&2; exit 1; }
+          bundle="$RUNNER_TEMP/obs-bundle.tar.zst"
+          curl --disable --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --max-filesize "${native[2]}" \
+            --connect-timeout 10 --max-time 300 --output "$bundle" "${native[0]}"
+          scripts/verify-obs-bundle-manifest.py \
+            --manifest "$manifest" \
+            --manifest-sha256 "$MANIFEST_SHA256" \
+            --platform linux \
+            --arch x86_64 \
+            --approved-libobs-revision "$APPROVED_LIBOBS_REVISION" \
+            --bundle "$bundle" \
+            --summary-out "$summary"
+          mkdir -p packaging/linux/out
+          cp "$bundle" "packaging/linux/out/obs-bundle-${native[3]}-x86_64.tar.zst"
+          {
+            echo "CROWD_CAST_OBS_BUNDLE_MANIFEST_PATH=$manifest"
+            echo "CROWD_CAST_OBS_BUNDLE_MANIFEST_SHA256=$MANIFEST_SHA256"
+          } >> "$GITHUB_ENV"
+          {
+            echo "manifest_url=$MANIFEST_URL"
+            echo "manifest_sha256=$MANIFEST_SHA256"
+            echo "bundle_url=${native[0]}"
+            echo "bundle_sha256=${native[1]}"
+            echo "bundle_size=${native[2]}"
+            echo "abi=${native[3]}"
+            echo "implementation_id=${native[4]}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve monotonic release identity
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_ID_FLOOR: ${{ vars.BUILD_ID_FLOOR }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Cargo version is not release SemVer: $version" >&2; exit 1; }
+          build='${{ github.run_number }}'
+          [[ "$build" =~ ^[1-9][0-9]*$ ]] || { echo 'Build number must be positive.' >&2; exit 1; }
+          [[ "$BUILD_ID_FLOOR" =~ ^(0|[1-9][0-9]*)$ ]] || { echo 'BUILD_ID_FLOOR must be a canonical non-negative integer.' >&2; exit 1; }
+          python3 - "$build" "$BUILD_ID_FLOOR" <<'PY'
+          import sys
+          if int(sys.argv[1]) <= int(sys.argv[2]):
+              raise SystemExit("build identity does not exceed the protected migration floor")
+          PY
+          channel='${{ inputs.channel }}'
+          if [[ "$channel" == prod ]]; then
+            tag="linux-v$version+$build"
+            feed_key=appcast-linux.json
+            upload_test=""
+          else
+            tag="linux-dev-v$version+$build"
+            feed_key=appcast-linux-dev.json
+            upload_test=1
+          fi
+          feed_url="https://$S3_BUCKET.s3.amazonaws.com/$feed_key"
+          [[ -z "$(git ls-remote origin "refs/tags/$tag")" ]] || { echo "Remote tag already exists: $tag" >&2; exit 1; }
+          if gh release view "$tag" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            echo "GitHub release already exists: $tag" >&2
             exit 1
           fi
-          build="${{ github.run_number }}"
-          channel="${{ github.event.inputs.channel }}"
-          bundle_url="https://github.com/${{ github.repository }}/releases/download/obs-bundle-${OBS_ABI}/obs-bundle-${OBS_ABI}-x86_64.tar.zst"
-          if [ "$channel" = "prod" ]; then
-            feed_key="appcast-linux.json"; tag="linux-v$base+$build"; prerelease="false"; upload_test=""; release_name="v$base"
-          else
-            # dev: isolated feed + pre-release + clips routed to uploads/TEST_VERSION/ (CROWD_CAST_UPLOAD_TEST)
-            feed_key="appcast-linux-dev.json"; tag="linux-dev-v$base+$build"; prerelease="true"; upload_test="1"; release_name="crowd-cast (Linux dev) $base build $build"
-          fi
           {
-            echo "marketing=$base"
+            echo "version=$version"
             echo "build=$build"
             echo "channel=$channel"
             echo "tag=$tag"
-            echo "release_name=$release_name"
-            echo "prerelease=$prerelease"
             echo "feed_key=$feed_key"
-            echo "feed_url=https://${S3_BUCKET}.s3.amazonaws.com/${feed_key}"
+            echo "feed_url=$feed_url"
             echo "upload_test=$upload_test"
-            echo "bundle_url=$bundle_url"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Fetch the per-ABI libobs bundle (from its GitHub Release)
-        run: |
-          # Pull the already-published bundle for $OBS_ABI (Release `obs-bundle-<abi>`) — NOT rebuilt
-          # here. Staged in packaging/linux/out/ (the layout build-binary.sh reads) so the container
-          # build links against it for -lobs. The SAME file is hashed into the manifest, so the
-          # manifest's bundle.sha256 matches exactly what users download from this Release URL.
-          mkdir -p packaging/linux/out
-          curl -fSL "${{ steps.ver.outputs.bundle_url }}" \
-               -o "packaging/linux/out/obs-bundle-${OBS_ABI}-x86_64.tar.zst"
-
-      - name: Build agent + signer on the glibc floor (AlmaLinux 9 container)
+      - name: Build agent and signer in exact builder image
         env:
           ENGINE: docker
-          CROWD_CAST_OBS_ABI: ${{ env.OBS_ABI }}
-          CROWD_CAST_BUILD_NUMBER: ${{ steps.ver.outputs.build }}
+          CROWD_CAST_BUILDER_IMAGE: ${{ vars.LINUX_BUILDER_IMAGE }}
+          CROWD_CAST_RELEASE_CHANNEL: ${{ steps.release.outputs.channel }}
+          CROWD_CAST_OBS_ABI: ${{ steps.native.outputs.abi }}
+          CROWD_CAST_BUILD_NUMBER: ${{ steps.release.outputs.build }}
           CROWD_CAST_API_GATEWAY_URL: ${{ secrets.CROWD_CAST_API_GATEWAY_URL }}
           CROWD_CAST_GOOGLE_CLIENT_ID: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_ID }}
-          CROWD_CAST_GOOGLE_CLIENT_SECRET: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_SECRET }}
-          CROWD_CAST_UPDATE_FEED_URL: ${{ steps.ver.outputs.feed_url }}
-          # Reuses the SAME Ed25519 public key as mac/win (base64 of the 32-byte raw key).
+          CROWD_CAST_UPDATE_FEED_URL: ${{ steps.release.outputs.feed_url }}
           CROWD_CAST_UPDATE_PUBKEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
-          # Empty on prod (build.rs ignores empty); "1" on dev → clips upload to uploads/TEST_VERSION/.
-          CROWD_CAST_UPLOAD_TEST: ${{ steps.ver.outputs.upload_test }}
+          CROWD_CAST_UPLOAD_TEST: ${{ steps.release.outputs.upload_test }}
         run: |
-          # Builds in the same AlmaLinux 9 / glibc-2.34 image as the libobs bundle (run-build-binary.sh
-          # builds the image + runs build-binary.sh), so the shipped ELF runs cross-distro. Emits the
-          # agent AND the manifest signer to packaging/linux/out/. Clean CI checkout has no dev
-          # .cargo/config.toml, so the mold-linker overlay is skipped automatically.
+          set -euo pipefail
           packaging/linux/run-build-binary.sh
           mkdir -p dist
-          cp "packaging/linux/out/crowd-cast-agent-x86_64"             "dist/crowd-cast-agent-x86_64"
-          cp "packaging/linux/out/cc-sign-manifest"                    "dist/cc-sign-manifest"
-          # Keep the bundle locally only to hash it into the manifest — it is NOT re-uploaded (it's
-          # already hosted in its per-ABI Release; the manifest points users there).
-          cp "packaging/linux/out/obs-bundle-${OBS_ABI}-x86_64.tar.zst" "dist/obs-bundle-${OBS_ABI}-x86_64.tar.zst"
+          cp packaging/linux/out/crowd-cast-agent-x86_64 dist/crowd-cast-agent-x86_64
+          cp packaging/linux/out/cc-sign-manifest dist/cc-sign-manifest
 
-      - name: Generate + sign the appcast manifest
+      - name: Generate and verify signed appcast
+        id: artifact
         env:
           ED_PRIVATE_KEY: ${{ secrets.CROWD_CAST_ED_PRIVATE_KEY }}
           ED_PUBLIC_KEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
         run: |
+          set -euo pipefail
           keyfile="$RUNNER_TEMP/ed25519.key"
-          # shellcheck disable=SC2064
-          trap "rm -f '$keyfile'" EXIT
+          trap 'rm -f "$keyfile"' EXIT
           printf '%s' "$ED_PRIVATE_KEY" > "$keyfile"
-          tag="${{ steps.ver.outputs.tag }}"
           scripts/release-linux.sh \
-            --version "${{ steps.ver.outputs.marketing }}" \
-            --build "${{ steps.ver.outputs.build }}" \
-            --abi "$OBS_ABI" \
-            --binary "dist/crowd-cast-agent-x86_64" \
-            --bundle "dist/obs-bundle-${OBS_ABI}-x86_64.tar.zst" \
-            --download-base "https://github.com/${{ github.repository }}/releases/download/$tag" \
-            --bundle-url "${{ steps.ver.outputs.bundle_url }}" \
-            --signer "dist/cc-sign-manifest" \
+            --version '${{ steps.release.outputs.version }}' \
+            --build '${{ steps.release.outputs.build }}' \
+            --abi '${{ steps.native.outputs.abi }}' \
+            --binary dist/crowd-cast-agent-x86_64 \
+            --bundle packaging/linux/out/obs-bundle-${{ steps.native.outputs.abi }}-x86_64.tar.zst \
+            --download-base 'https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}' \
+            --bundle-url '${{ steps.native.outputs.bundle_url }}' \
+            --bundle-manifest-url '${{ steps.native.outputs.manifest_url }}' \
+            --bundle-manifest-sha256 '${{ steps.native.outputs.manifest_sha256 }}' \
+            --bundle-implementation-id '${{ steps.native.outputs.implementation_id }}' \
+            --signer dist/cc-sign-manifest \
             --key-file "$keyfile" \
+            --public-key "$ED_PUBLIC_KEY" \
             --out-dir dist
-          python3 - "${{ steps.ver.outputs.feed_url }}" "$ED_PUBLIC_KEY" \
+          python3 - '${{ steps.release.outputs.feed_url }}' "$ED_PUBLIC_KEY" \
             packaging/linux/install.sh dist/install-linux.sh <<'PY'
           import pathlib, sys
-          feed_url, pubkey, src, dest = sys.argv[1:]
-          text = pathlib.Path(src).read_text(encoding="utf-8")
+          feed_url, public_key, source, destination = sys.argv[1:]
+          text = pathlib.Path(source).read_text(encoding="utf-8")
           text = text.replace("__CROWD_CAST_DEFAULT_FEED_URL__", feed_url)
-          text = text.replace("__CROWD_CAST_UPDATE_PUBKEY__", pubkey)
-          pathlib.Path(dest).write_text(text, encoding="utf-8")
+          text = text.replace("__CROWD_CAST_UPDATE_PUBKEY__", public_key)
+          if "__CROWD_CAST_" in text:
+              raise SystemExit("installer retains an unresolved release placeholder")
+          pathlib.Path(destination).write_text(text, encoding="utf-8")
           PY
           chmod 0755 dist/install-linux.sh
           cp assets/logo.png dist/logo.png
+          for entry in \
+            binary:crowd-cast-agent-x86_64 \
+            installer:install-linux.sh \
+            logo:logo.png
+          do
+            key="${entry%%:*}"
+            file="${entry#*:}"
+            path="dist/$file"
+            echo "${key}_sha256=$(sha256sum "$path" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+            echo "${key}_size=$(wc -c < "$path" | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          done
 
-      # Prod only: re-attach the latest signed macOS (.dmg) and Windows (.exe) downloads so this
-      # release — which becomes "Latest" — keeps working /releases/latest/download/ buttons for ALL
-      # platforms (mirrors windows-release.yml's carry-forward). It re-downloads already-signed
-      # artifacts; no Mac, no re-signing. Purely the human-download surface — every platform's
-      # auto-update feed points at its own immutable asset, so updates are untouched. Best-effort:
-      # never fail the Linux release over a carried download. Dev pre-releases skip this (never "Latest").
-      - name: Carry forward macOS + Windows downloads
-        if: steps.ver.outputs.channel == 'prod'
+      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Reserve exact release identity before publication
+        run: |
+          set -euo pipefail
+          versioning="$(aws s3api get-bucket-versioning --bucket "$S3_BUCKET" --query Status --output text)"
+          [[ "$versioning" == Enabled ]] || { echo 'S3 bucket versioning must be Enabled.' >&2; exit 1; }
+          reservation="$RUNNER_TEMP/release-reservation.json"
+          python3 - "$reservation" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as f:
+              json.dump({
+                  "schema": "crowd-cast-release-reservation-v1",
+                  "platform": "linux",
+                  "channel": "${{ steps.release.outputs.channel }}",
+                  "build": int("${{ steps.release.outputs.build }}"),
+                  "commit": "${{ github.sha }}",
+                  "run_id": "${{ github.run_id }}",
+              }, f, separators=(",", ":"), sort_keys=True)
+          PY
+          aws s3api put-object \
+            --bucket "$S3_BUCKET" \
+            --key 'release-ledger/linux/${{ steps.release.outputs.channel }}/${{ steps.release.outputs.build }}/reservation.json' \
+            --body "$reservation" \
+            --if-none-match '*' >/dev/null
+
+      - name: Publish and read back exact GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set +e
-          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 30 --json tagName --jq '.[].tagName')
-          for spec in "CrowdCast.dmg" "crowd-cast-setup.exe"; do
-            found=""
-            for t in $tags; do
-              names=$(gh release view "$t" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null)
-              echo "$names" | grep -qx "$spec" && { found="$t"; break; }
-            done
-            if [ -n "$found" ]; then
-              gh release download "$found" --repo "$GITHUB_REPOSITORY" --pattern "$spec" --dir dist \
-                && echo "carried forward $spec from $found" || echo "skip: download failed for $spec"
-            else
-              echo "skip: no prior release has $spec yet (its button stays 404 until that platform ships)"
-            fi
+          set -euo pipefail
+          tag='${{ steps.release.outputs.tag }}'
+          title='crowd-cast Linux ${{ steps.release.outputs.version }} build ${{ steps.release.outputs.build }} (${{ inputs.channel }})'
+          args=(release create "$tag" \
+            dist/crowd-cast-agent-x86_64 \
+            dist/install-linux.sh \
+            dist/logo.png \
+            --repo '${{ github.repository }}' \
+            --target '${{ github.sha }}' \
+            --title "$title" \
+            --latest=false)
+          [[ '${{ inputs.channel }}' == dev ]] && args+=(--prerelease)
+          gh "${args[@]}"
+          gh api 'repos/${{ github.repository }}/releases/tags/${{ steps.release.outputs.tag }}' > "$RUNNER_TEMP/release.json"
+          python3 - "$RUNNER_TEMP/release.json" <<'PY'
+          import json, sys
+          release = json.load(open(sys.argv[1], encoding="utf-8"))
+          if not release.get("immutable"):
+              raise SystemExit("repository immutable releases must be enabled")
+          if release.get("target_commitish") != "${{ github.sha }}":
+              raise SystemExit("GitHub release target SHA mismatch")
+          if bool(release.get("prerelease")) != ("${{ inputs.channel }}" == "dev"):
+              raise SystemExit("GitHub prerelease state mismatch")
+          expected = {
+              "crowd-cast-agent-x86_64": int("${{ steps.artifact.outputs.binary_size }}"),
+              "install-linux.sh": int("${{ steps.artifact.outputs.installer_size }}"),
+              "logo.png": int("${{ steps.artifact.outputs.logo_size }}"),
+          }
+          actual = {asset["name"]: asset["size"] for asset in release.get("assets", [])}
+          if actual != expected:
+              raise SystemExit(f"GitHub release asset set mismatch: {actual!r}")
+          PY
+          mkdir "$RUNNER_TEMP/release-readback"
+          gh release download "$tag" --repo '${{ github.repository }}' --dir "$RUNNER_TEMP/release-readback"
+          for file in crowd-cast-agent-x86_64 install-linux.sh logo.png; do
+            case "$file" in
+              crowd-cast-agent-x86_64) expected='${{ steps.artifact.outputs.binary_sha256 }}' ;;
+              install-linux.sh) expected='${{ steps.artifact.outputs.installer_sha256 }}' ;;
+              logo.png) expected='${{ steps.artifact.outputs.logo_sha256 }}' ;;
+            esac
+            [[ "$(sha256sum "$RUNNER_TEMP/release-readback/$file" | cut -d' ' -f1)" == "$expected" ]] \
+              || { echo "GitHub asset readback mismatch: $file" >&2; exit 1; }
           done
-          set -e
 
-      - name: Create GitHub Release (linux binary + carried mac/win downloads)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          prerelease: ${{ steps.ver.outputs.prerelease }}
-          name: ${{ steps.ver.outputs.release_name }}
-          # The Linux binary is built here; the libobs bundle stays in its per-ABI Release (the
-          # manifest points there, no re-upload); the dmg/exe are carried forward on prod only.
-          # fail_on_unmatched_files=false so dev (no carried dmg/exe) uploads just the binary.
-          fail_on_unmatched_files: false
-          files: |
-            dist/crowd-cast-agent-x86_64
-            dist/install-linux.sh
-            dist/logo.png
-            dist/CrowdCast.dmg
-            dist/crowd-cast-setup.exe
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
-      # Publish the feed LAST — once it's live, clients start updating, so the release asset
-      # (previous step) must already exist at its download URL. Key is per-channel (prod:
-      # appcast-linux.json, dev: appcast-linux-dev.json) so a dev run never overwrites the prod feed.
-      - name: Publish appcast manifest to S3
+      - name: Publish immutable release receipt
         run: |
-          key="${{ steps.ver.outputs.feed_key }}"
-          aws s3 cp dist/appcast-linux.json     "s3://$S3_BUCKET/$key"
-          aws s3 cp dist/appcast-linux.json.sig "s3://$S3_BUCKET/$key.sig"
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/release-receipt.json"
+          python3 - "$receipt" <<'PY'
+          import json, sys
+          receipt = {
+              "schema": "crowd-cast-release-receipt-v1",
+              "platform": "linux",
+              "channel": "${{ inputs.channel }}",
+              "version": "${{ steps.release.outputs.version }}",
+              "build": int("${{ steps.release.outputs.build }}"),
+              "commit": "${{ github.sha }}",
+              "runner_image": "${{ runner.os }}/${{ vars.LINUX_RUNNER_IMAGE_VERSION }}",
+              "builder_image": "${{ vars.LINUX_BUILDER_IMAGE }}",
+              "libobs_manifest_sha256": "${{ steps.native.outputs.manifest_sha256 }}",
+              "libobs_implementation_id": "${{ steps.native.outputs.implementation_id }}",
+              "assets": {
+                  "crowd-cast-agent-x86_64": {"size": int("${{ steps.artifact.outputs.binary_size }}"), "sha256": "${{ steps.artifact.outputs.binary_sha256 }}"},
+                  "install-linux.sh": {"size": int("${{ steps.artifact.outputs.installer_size }}"), "sha256": "${{ steps.artifact.outputs.installer_sha256 }}"},
+                  "logo.png": {"size": int("${{ steps.artifact.outputs.logo_size }}"), "sha256": "${{ steps.artifact.outputs.logo_sha256 }}"},
+              },
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as f:
+              json.dump(receipt, f, separators=(",", ":"), sort_keys=True)
+          PY
+          key='release-ledger/linux/${{ inputs.channel }}/${{ steps.release.outputs.build }}/receipt.json'
+          aws s3api put-object --bucket "$S3_BUCKET" --key "$key" --body "$receipt" --content-type application/json --if-none-match '*' >/dev/null
+          aws s3api get-object --bucket "$S3_BUCKET" --key "$key" "$RUNNER_TEMP/release-receipt-readback.json" >/dev/null
+          cmp "$receipt" "$RUNNER_TEMP/release-receipt-readback.json"
+
+      - name: Publish signed feed pointer last with rollback
+        run: |
+          set -euo pipefail
+          scripts/publish-s3-signed-feed.sh \
+            --bucket "$S3_BUCKET" \
+            --pointer-key '${{ steps.release.outputs.feed_key }}' \
+            --archive-prefix 'release-feed-archive/linux/${{ inputs.channel }}/${{ steps.release.outputs.tag }}' \
+            --manifest dist/appcast-linux.json \
+            --signature dist/appcast-linux.json.sig

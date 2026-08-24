@@ -30,21 +30,23 @@ Infrastructure for capturing paired screencast and keyboard/mouse input data.
 
 ## Quick Start
 
-> [![Download for macOS](https://img.shields.io/badge/Download%20for%20macOS-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/CrowdCast.dmg)
-> [![Download for Windows](https://img.shields.io/badge/Download%20for%20Windows-0078D6?style=for-the-badge&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTAgMy40NDkgOS43NSAyLjF2OS40NTFIMFptMTAuOTQ5LTEuNTAxTDI0IDB2MTEuNEgxMC45NDlaTTAgMTIuNmg5Ljc1djkuNDUxTDAgMjAuNjk5Wm0xMC45NDkgMEgyNFYyNGwtMTMuMDUxLTEuODAxWiIvPjwvc3ZnPg%3D%3D&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/crowd-cast-setup.exe)
-> [![Download for Linux](https://img.shields.io/badge/Download%20for%20Linux-E95420?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh)
+> [![Download for macOS](https://img.shields.io/badge/Download%20for%20macOS-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/p-doom/crowd-cast/releases)
+> [![Download for Windows](https://img.shields.io/badge/Download%20for%20Windows-0078D6?style=for-the-badge&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTAgMy40NDkgOS43NSAyLjF2OS40NTFIMFptMTAuOTQ5LTEuNTAxTDI0IDB2MTEuNEgxMC45NDlaTTAgMTIuNmg5Ljc1djkuNDUxTDAgMjAuNjk5Wm0xMC45NDkgMEgyNFYyNGwtMTMuMDUxLTEuODAxWiIvPjwvc3ZnPg%3D%3D&logoColor=white)](https://github.com/p-doom/crowd-cast/releases)
+> [![Download for Linux](https://img.shields.io/badge/Download%20for%20Linux-E95420?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/p-doom/crowd-cast/releases)
 
 Download the installer for your platform and follow the instructions in the setup wizard.
 
 - **macOS**: open `CrowdCast.dmg` and grant permissions by following the setup wizard.
-- **Windows**: run `crowd-cast-setup.exe`. The agent runs from a single executable; OBS is fetched automatically on first launch and no special permissions are required. If SmartScreen shows "Windows protected your PC", click More info, then Run anyway.
-- **Linux**: run `curl -fsSL https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh | bash` (the Download for Linux button links to this script). It installs into `~/.local` and downloads libobs during setup. Supported sessions: GNOME on Wayland and sway.
+- **Windows**: download `crowd-cast-setup.exe` from the newest `windows-v...` production release.
+- **Linux**: production packaging is fail-closed while the exact OBS runtime is moved into a pre-execution trusted package. Supported sessions are GNOME on Wayland and sway.
 
-<!-- Download links use /releases/latest/download/<asset> with stable filenames so they never need per-release edits. Each resolves to the newest release containing that asset. -->
+GitHub exposes one repository-wide “latest” release, not one per platform. Direct
+download buttons therefore lead to the Releases page; platform assets are never
+copied into an unrelated release.
 
 ## Features
 
-- **Single binary**: No external OBS installation required (libobs is embedded)
+- **Self-contained installation**: No separate OBS Studio installation required
 - **Privacy-aware capture**: Only records when selected applications are in the foreground
 - **Full control**: Start or stop recording at any time, and delete the last 10 minutes of recording
 - **Automatic updates**: Sparkle framework keeps the app up to date in the background
@@ -55,11 +57,11 @@ Download the installer for your platform and follow the instructions in the setu
 
 ## How It Works
 
-crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsproject/obs-studio) for screen capture and recording, eliminating the need to install OBS Studio separately.
+crowd-cast ships an exact, release-bound [libobs](https://github.com/obsproject/obs-studio) runtime for screen capture and recording, eliminating the need to install OBS Studio separately.
 
 **Key components:**
 
-- **Embedded libobs** - Screen/window capture with hardware encoding (via [libobs-rs](https://github.com/joshprk/libobs-rs))
+- **Release-bound libobs** - Screen/window capture with hardware encoding (via [libobs-rs](https://github.com/joshprk/libobs-rs))
 - **Sync Engine** - Coordinates recording with input capture, filters by frontmost app
 - **Input Capture** - Cross-platform keyboard/mouse capture (rdev/evdev)
 - **System Tray** - Control recording from the menu bar
@@ -95,7 +97,7 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 
 ## Features
 
-- **Single binary**: No external OBS installation required (libobs is embedded)
+- **Self-contained installation**: No separate OBS Studio installation required
 - **Privacy-aware capture**: Only records when selected applications are in the foreground
 - **Automatic updates**: signed background updates on macOS, Windows, and Linux
 - **Idle detection**: Automatically pauses recording when you step away, resumes on return
@@ -107,11 +109,11 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 
 ### For users
 
-Download the installer for your platform from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest):
+Download the installer from the newest production release for your platform on the [Releases page](https://github.com/p-doom/crowd-cast/releases):
 
 - macOS: `CrowdCast.dmg`
 - Windows: `crowd-cast-setup.exe`
-- Linux: `curl -fsSL https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh | bash`
+- Linux: production packaging is currently fail-closed pending a pre-execution trusted OBS closure
 
 Linux support is limited to GNOME on Wayland and sway. GNOME supports per-app capture; sway currently supports full-screen capture.
 
@@ -161,42 +163,41 @@ only `cargo build`/`run` will.
 
 #### macOS Distribution
 
-First-time setup on a release machine:
+An operator provisions each dedicated macOS signing runner once, through an
+interactive TTY. Password prompts are owned by Apple's tools and are never passed
+through script arguments or environment variables:
 
 ```bash
 scripts/setup-macos-signing.sh \
-  --p12 /path/to/developer-id.p12
+  --p12 /path/to/developer-id.p12 \
+  --identity "Developer ID Application: Your Name (TEAMID)" \
+  --apple-id operator@example.com \
+  --team-id TEAMID
 ```
 
-For a full release (build, sign, notarize, publish to GitHub Releases + upload appcast to S3):
+The matching Sparkle private key must also be pre-provisioned in that runner's
+Keychain. Release builds, signing, notarization, GitHub publication, and the S3
+appcast update are authorized only by the protected `macos-release.yml` workflow.
+Developer workstations have no release publisher.
 
 ```bash
-scripts/build-and-publish-macos.sh \
-  --github-repo p-doom/crowd-cast \
-  --s3-bucket crowd-cast-bucket \
-  --identity "Developer ID Application: Your Name (TEAMID)" \
-  --notarize \
-  --version 1.0.0 \
-  --build-number 1055 \
-  --sparkle-public-ed-key "YOUR_PUBLIC_KEY" \
-  --sparkle-private-ed-key-file /path/to/private-key.txt
+gh workflow run macos-release.yml --ref main -f channel=prod
 ```
 
 Auto-updates are delivered via Sparkle using an appcast hosted on S3.
 
 ### Linux
 
-Linux installs into user space under `~/.local` and downloads the matching libobs bundle during installation. The production installer is published with each release:
-
-```bash
-curl -fsSL https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh | bash
-```
+Linux production release is fail-closed while the exact OBS runtime is moved out
+of the former user-writable pre-main loader path and into a signed or read-only
+package that can authorize it before process start.
 
 Supported Linux sessions are GNOME on Wayland and sway. Other desktop sessions are blocked during setup so the agent does not run in an unvalidated capture mode. Linux auto-updates use a signed appcast hosted on S3 and install silently when recording and uploads are idle.
 
 ### Windows
 
-Download `crowd-cast-setup.exe` from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest) and run the setup wizard. Windows auto-updates are delivered through the signed Windows appcast.
+Windows production release is fail-closed while the signed installer is migrated
+to carry the exact OBS runtime closure under protected installation ACLs.
 
 ## Configuration
 
@@ -271,8 +272,8 @@ crowd-cast-agent
 
 The agent will:
 
-1. Bootstrap OBS libraries (downloads if needed)
-2. Initialize embedded libobs for capture
+1. Verify and initialize the release-bound libobs runtime
+2. Initialize capture
 3. Show in your system tray
 4. Capture input when selected apps are in foreground
 
@@ -324,8 +325,8 @@ The agent uses [libobs-rs](https://github.com/joshprk/libobs-rs) to embed OBS fu
 
 - `libobs` - Raw FFI bindings to libobs
 - `libobs-wrapper` - Safe Rust wrapper
-- `libobs-bootstrapper` - Downloads OBS binaries at runtime (macOS)
-- `cargo-obs-build` - Downloads OBS binaries at build time
+- `libobs-bootstrapper` - Verifies exact native bundle inputs used by supported build paths
+- `cargo-obs-build` - Integrates the exact native bundle during supported builds
 
 The fork at `libobs-rs/` includes macOS support from [PR #53](https://github.com/joshprk/libobs-rs/pull/53).
 
@@ -343,53 +344,33 @@ pub fn new_window_capture(ctx: &ObsContext, window_name: &str) -> Result<ObsSour
 
 ### macOS
 
-First-time setup on a release machine:
+Provision the dedicated signing runner interactively once:
 
 ```bash
 scripts/setup-macos-signing.sh \
-  --p12 /path/to/developer-id.p12
+  --p12 /path/to/developer-id.p12 \
+  --identity "Developer ID Application: Your Name (TEAMID)" \
+  --apple-id operator@example.com \
+  --team-id TEAMID
 ```
 
-For a full release (build, sign, notarize, publish to GitHub Releases + upload appcast to S3):
+Import the matching Sparkle signing key into the runner's Keychain, then use the
+protected CI workflow. The workflow verifies the exact runner, toolchain, Apple
+signing identity, notary profile, Sparkle public key, and native bundle before it
+builds or publishes anything.
 
 ```bash
-scripts/build-and-publish-macos.sh \
-  --github-repo p-doom/crowd-cast \
-  --s3-bucket crowd-cast-bucket \
-  --identity "Developer ID Application: Your Name (TEAMID)" \
-  --notarize \
-  --version 1.0.0 \
-  --build-number 1055 \
-  --sparkle-public-ed-key "YOUR_PUBLIC_KEY" \
-  --sparkle-private-ed-key-file /path/to/private-key.txt
+gh workflow run macos-release.yml --ref main -f channel=prod
 ```
 
 Auto-updates are delivered via Sparkle using an appcast hosted on S3.
 
 ### Windows
 
-Build the per-user installer (no admin / UAC required) with [Inno Setup](https://jrsoftware.org/isinfo.php):
-
-```powershell
-# One-time: install the Inno Setup compiler
-winget install JRSoftware.InnoSetup
-
-# Build the release binary + installer
-$env:CROWD_CAST_API_GATEWAY_URL = "https://.../prod/presign"
-pwsh scripts/build-windows-installer.ps1
-# -> dist/crowd-cast-setup-<version>.exe
-```
-
-The installer (`installer/windows/crowd-cast.iss`) installs the agent and its
-`obs.dll` loader under `%LOCALAPPDATA%\Programs\crowd-cast`, creates a Start Menu
-shortcut tagged with the app's AppUserModelID (so toast notifications are branded
-"crowd-cast"), and registers an uninstaller that stops the agent and removes the
-autostart entry and install directory. Autostart itself is managed in-app via the
-setup wizard's "start at login" option.
-
-On first launch the agent downloads the rest of the OBS runtime (codecs,
-plugins) into the install folder and relaunches itself automatically, a
-one-time step that needs network access.
+Windows production release is fail-closed while the installer is migrated to
+carry the exact OBS runtime closure under protected installation ACLs. The
+release workflow cannot publish the former per-user loader plus first-launch
+download design.
 
 ### Linux
 

@@ -27,8 +27,8 @@ Options:
   --debug                      Build debug binary
   --identity "<identity>"      Developer ID Application identity
   --entitlements <plist>       Entitlements plist path
-  --version <semver>           CFBundleShortVersionString (defaults to Cargo.toml version)
-  --build-number <number>      CFBundleVersion (defaults to UTC timestamp)
+  --version <semver>           CFBundleShortVersionString
+  --build-number <number>      CFBundleVersion
   --feed-url <url>             Sparkle appcast feed URL
   --sparkle-public-ed-key <k>  Sparkle SUPublicEDKey value
   --disable-auto-checks        Set SUEnableAutomaticChecks to false
@@ -99,10 +99,6 @@ done
 
 cd "$PROJECT_ROOT"
 
-default_version() {
-    sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1
-}
-
 plist_set_string() {
     local plist_path="$1"
     local key="$2"
@@ -138,18 +134,21 @@ sign_file() {
     codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$path"
 }
 
-APP_VERSION="${APP_VERSION:-$(default_version)}"
-BUILD_NUMBER="${BUILD_NUMBER:-$(date -u +%Y%m%d%H%M%S)}"
+[[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || { echo "Version must be release SemVer." >&2; exit 1; }
+[[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "Build number must be a positive integer." >&2; exit 1; }
+[[ -n "$SPARKLE_FEED_URL" ]] || { echo "Sparkle feed URL is required." >&2; exit 1; }
+[[ "$SPARKLE_PUBLIC_ED_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]] \
+    || { echo "Sparkle public key must be canonical base64 for 32 bytes." >&2; exit 1; }
 
-if [[ -z "${CROWD_CAST_SKIP_SPARKLE:-}" ]]; then
-    "$PROJECT_ROOT/scripts/fetch-sparkle.sh" >/dev/null
-fi
+"$PROJECT_ROOT/scripts/fetch-sparkle.sh" >/dev/null
 
 echo "Building $BUILD_TYPE binary..."
 if [[ "$BUILD_TYPE" == "release" ]]; then
-    cargo build --release
+    cargo build --release --locked --offline
 else
-    cargo build
+    cargo build --locked --offline
 fi
 
 TARGET_DIR="target/${BUILD_TYPE}"
@@ -206,15 +205,17 @@ for dylib in "${TARGET_DIR}"/*.dylib; do
     fi
 done
 
-SPARKLE_DIR="${CROWD_CAST_SPARKLE_DIR:-$PROJECT_ROOT/build/sparkle/${CROWD_CAST_SPARKLE_VERSION:-2.8.1}}"
-if [[ -z "${CROWD_CAST_SKIP_SPARKLE:-}" && -d "$SPARKLE_DIR/Sparkle.framework" ]]; then
-    cp -R "$SPARKLE_DIR/Sparkle.framework" "$APP_DIR/Contents/Frameworks/"
-fi
+SPARKLE_DIR="$PROJECT_ROOT/build/sparkle/2.8.1"
+[[ -d "$SPARKLE_DIR/Sparkle.framework" ]] \
+    || { echo "Verified Sparkle.framework is missing: $SPARKLE_DIR/Sparkle.framework" >&2; exit 1; }
+cp -R "$SPARKLE_DIR/Sparkle.framework" "$APP_DIR/Contents/Frameworks/"
 
 echo "Bundled libobs loader runtime into Frameworks (plugins/data remain external)."
 
 echo "Updating binary rpaths..."
-install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_EXEC" 2>/dev/null || true
+if ! otool -l "$APP_EXEC" | grep -A2 LC_RPATH | grep -Fq '@executable_path/../Frameworks'; then
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_EXEC"
+fi
 
 if [[ "$SKIP_SIGN" -eq 0 ]]; then
     if [[ -z "$SIGN_IDENTITY" ]]; then

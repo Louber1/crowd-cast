@@ -25,6 +25,10 @@ BUNDLE_URL_OVERRIDE=""     # full bundle URL; defaults to <download-base>/<bundl
                            # normally lives in its own per-ABI Release, so its URL differs from the
                            # binary's app-release URL.
 KEY_FILE="${CROWD_CAST_ED_PRIVATE_KEY_FILE:-}"
+PUBLIC_KEY=""
+BUNDLE_MANIFEST_URL=""
+BUNDLE_MANIFEST_SHA256=""
+BUNDLE_IMPLEMENTATION_ID=""
 OUT_DIR="$PROJECT_ROOT/dist"
 NOTES=""
 CRITICAL="false"
@@ -49,6 +53,13 @@ Options:
                          Point this at the per-ABI bundle Release so the bundle isn't re-uploaded.
   --key-file <path>      Ed25519 private key (base64; 32-byte seed or 64-byte seed||pub).
                          Defaults to \$CROWD_CAST_ED_PRIVATE_KEY_FILE.
+  --public-key <base64>  Exact public key embedded in the application
+  --bundle-manifest-url <url>
+                         Exact native bundle manifest URL bound into the application
+  --bundle-manifest-sha256 <hex>
+                         SHA-256 of the exact native bundle manifest bytes
+  --bundle-implementation-id <id>
+                         Compiled native implementation identity
   --out-dir <dir>        Output dir for the manifest + sig (default: dist/)
   --notes <text>         Release notes string
   --critical             Mark this release critical (forward-compat flag)
@@ -68,6 +79,10 @@ while [[ $# -gt 0 ]]; do
         --download-base) DOWNLOAD_BASE="${2%/}"; shift 2 ;;
         --bundle-url) BUNDLE_URL_OVERRIDE="$2"; shift 2 ;;
         --key-file) KEY_FILE="$2"; shift 2 ;;
+        --public-key) PUBLIC_KEY="$2"; shift 2 ;;
+        --bundle-manifest-url) BUNDLE_MANIFEST_URL="$2"; shift 2 ;;
+        --bundle-manifest-sha256) BUNDLE_MANIFEST_SHA256="$2"; shift 2 ;;
+        --bundle-implementation-id) BUNDLE_IMPLEMENTATION_ID="$2"; shift 2 ;;
         --out-dir) OUT_DIR="$2"; shift 2 ;;
         --notes) NOTES="$2"; shift 2 ;;
         --critical) CRITICAL="true"; shift ;;
@@ -83,11 +98,26 @@ err() { echo "error: $*" >&2; exit 1; }
 [[ -n "$VERSION" ]]       || err "missing --version"
 [[ -n "$ABI" ]]           || err "missing --abi"
 [[ -n "$DOWNLOAD_BASE" ]] || err "missing --download-base"
+[[ "$BUILD" =~ ^[1-9][0-9]*$ ]] || err "--build must be a positive integer"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || err "--version must be release SemVer"
 [[ -f "$BINARY" ]]        || err "binary not found: $BINARY"
 [[ -f "$BUNDLE" ]]        || err "bundle not found: $BUNDLE"
 [[ -n "$KEY_FILE" && -f "$KEY_FILE" ]] || err "signing key file not found (set --key-file or \$CROWD_CAST_ED_PRIVATE_KEY_FILE)"
+[[ -n "$PUBLIC_KEY" ]] || err "missing --public-key"
+[[ "$BUNDLE_MANIFEST_URL" == https://* ]] || err "--bundle-manifest-url must be HTTPS"
+[[ "$BUNDLE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || err "--bundle-manifest-sha256 must be canonical lowercase SHA-256"
+[[ "$BUNDLE_IMPLEMENTATION_ID" =~ ^[A-Za-z0-9._-]+$ ]] || err "invalid --bundle-implementation-id"
 command -v sha256sum >/dev/null 2>&1 || err "'sha256sum' is required"
 command -v python3   >/dev/null 2>&1 || err "'python3' is required (manifest JSON assembly)"
+python3 - "$DOWNLOAD_BASE" "$BUNDLE_MANIFEST_URL" "${BUNDLE_URL_OVERRIDE:-$DOWNLOAD_BASE/placeholder}" <<'PY'
+import sys
+import urllib.parse
+
+for value in sys.argv[1:]:
+    url = urllib.parse.urlsplit(value)
+    if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment:
+        raise SystemExit("release URLs must be exact HTTPS without credentials, query, or fragment")
+PY
 
 # Build the signer on demand if not provided. It needs the release-tools feature.
 if [[ -z "$SIGNER" ]]; then
@@ -107,6 +137,8 @@ BUNDLE_URL="${BUNDLE_URL_OVERRIDE:-$DOWNLOAD_BASE/$BUNDLE_NAME}"
 
 BIN_SHA="$(sha256sum "$BINARY"  | awk '{print $1}')"
 BUNDLE_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+BIN_SIZE="$(wc -c < "$BINARY" | tr -d ' ')"
+BUNDLE_SIZE="$(wc -c < "$BUNDLE" | tr -d ' ')"
 
 mkdir -p "$OUT_DIR"
 MANIFEST="$OUT_DIR/appcast-linux.json"
@@ -117,7 +149,9 @@ BIN_URL="$BIN_URL" \
 BUNDLE_URL="$BUNDLE_URL" \
 VERSION="$VERSION" BUILD="$BUILD" ABI="$ABI" NOTES="$NOTES" \
 CRITICAL="$CRITICAL" MIN_VERSION="$MIN_VERSION" \
-BIN_SHA="$BIN_SHA" BUNDLE_SHA="$BUNDLE_SHA" \
+BIN_SHA="$BIN_SHA" BIN_SIZE="$BIN_SIZE" BUNDLE_SHA="$BUNDLE_SHA" BUNDLE_SIZE="$BUNDLE_SIZE" \
+BUNDLE_MANIFEST_URL="$BUNDLE_MANIFEST_URL" BUNDLE_MANIFEST_SHA256="$BUNDLE_MANIFEST_SHA256" \
+BUNDLE_IMPLEMENTATION_ID="$BUNDLE_IMPLEMENTATION_ID" \
 python3 - "$MANIFEST" <<'PY'
 import json, os, sys
 manifest = {
@@ -126,8 +160,15 @@ manifest = {
     "notes": os.environ.get("NOTES", ""),
     "critical": os.environ["CRITICAL"] == "true",
     "minimum_version": os.environ.get("MIN_VERSION", ""),
-    "binary": {"url": os.environ["BIN_URL"], "sha256": os.environ["BIN_SHA"]},
-    "bundle": {"abi": os.environ["ABI"], "url": os.environ["BUNDLE_URL"], "sha256": os.environ["BUNDLE_SHA"]},
+    "binary": {"url": os.environ["BIN_URL"], "sha256": os.environ["BIN_SHA"], "size": int(os.environ["BIN_SIZE"])},
+    "bundle_manifest": {"url": os.environ["BUNDLE_MANIFEST_URL"], "sha256": os.environ["BUNDLE_MANIFEST_SHA256"]},
+    "bundle": {
+        "abi": os.environ["ABI"],
+        "implementation_id": os.environ["BUNDLE_IMPLEMENTATION_ID"],
+        "url": os.environ["BUNDLE_URL"],
+        "sha256": os.environ["BUNDLE_SHA"],
+        "size": int(os.environ["BUNDLE_SIZE"]),
+    },
 }
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(manifest, f, indent=2, sort_keys=True)
@@ -135,7 +176,11 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
 PY
 
 # Sign the exact manifest bytes (domain-separated inside the signer).
-"$SIGNER" --manifest "$MANIFEST" --key-file "$KEY_FILE" --out "$MANIFEST.sig"
+"$SIGNER" \
+    --manifest "$MANIFEST" \
+    --key-file "$KEY_FILE" \
+    --expected-public-key "$PUBLIC_KEY" \
+    --out "$MANIFEST.sig"
 
 echo ">> wrote $MANIFEST + $MANIFEST.sig"
 echo "   version=$VERSION build=$BUILD abi=$ABI"

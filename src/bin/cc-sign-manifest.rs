@@ -25,7 +25,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 
 fn usage() -> String {
-    "usage: cc-sign-manifest --manifest <path> [--out <path>] [--key-file <path>]\n\
+    "usage: cc-sign-manifest --manifest <path> --expected-public-key <base64> [--out <path>] [--key-file <path>]\n\
      \n\
      The private key is read from --key-file or the CROWD_CAST_ED_PRIVATE_KEY env var (base64;\n\
      either a 32-byte seed or a 64-byte seed||pubkey). --out defaults to <manifest>.sig."
@@ -36,6 +36,7 @@ fn run() -> Result<(), String> {
     let mut manifest: Option<String> = None;
     let mut out: Option<String> = None;
     let mut key_file: Option<String> = None;
+    let mut expected_public_key: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -43,6 +44,10 @@ fn run() -> Result<(), String> {
             "--manifest" => manifest = Some(args.next().ok_or("--manifest needs a value")?),
             "--out" => out = Some(args.next().ok_or("--out needs a value")?),
             "--key-file" => key_file = Some(args.next().ok_or("--key-file needs a value")?),
+            "--expected-public-key" => {
+                expected_public_key =
+                    Some(args.next().ok_or("--expected-public-key needs a value")?)
+            }
             "-h" | "--help" => {
                 println!("{}", usage());
                 return Ok(());
@@ -52,6 +57,8 @@ fn run() -> Result<(), String> {
     }
 
     let manifest_path = manifest.ok_or_else(|| format!("missing --manifest\n\n{}", usage()))?;
+    let expected_public_key = expected_public_key
+        .ok_or_else(|| format!("missing --expected-public-key\n\n{}", usage()))?;
     let out_path = out.unwrap_or_else(|| format!("{manifest_path}.sig"));
 
     // Key: --key-file wins, else the env var. Never echo it.
@@ -76,6 +83,19 @@ fn run() -> Result<(), String> {
         }
     };
     let signing_key = SigningKey::from_bytes(&seed);
+    let public_key = signing_key.verifying_key().to_bytes();
+    let expected_public_key_bytes = STANDARD
+        .decode(expected_public_key.trim())
+        .map_err(|e| format!("expected public key is not valid base64: {e}"))?;
+    if STANDARD.encode(&expected_public_key_bytes) != expected_public_key.trim() {
+        return Err("expected public key is not canonical base64".to_string());
+    }
+    let expected_public_key: [u8; 32] = expected_public_key_bytes
+        .try_into()
+        .map_err(|_| "expected public key must contain exactly 32 bytes".to_string())?;
+    if expected_public_key != public_key {
+        return Err("private key does not match the expected application public key".to_string());
+    }
 
     let manifest_bytes = std::fs::read(&manifest_path)
         .map_err(|e| format!("failed to read manifest {manifest_path}: {e}"))?;
@@ -87,7 +107,7 @@ fn run() -> Result<(), String> {
     std::fs::write(&out_path, &sig_b64)
         .map_err(|e| format!("failed to write signature {out_path}: {e}"))?;
 
-    let pubkey_b64 = STANDARD.encode(signing_key.verifying_key().to_bytes());
+    let pubkey_b64 = STANDARD.encode(public_key);
     eprintln!("signed {manifest_path} -> {out_path}");
     eprintln!("public key (must equal the baked CROWD_CAST_UPDATE_PUBKEY): {pubkey_b64}");
     Ok(())

@@ -23,6 +23,7 @@ param(
     [Parameter(Mandatory)][string]$Version,
     [Parameter(Mandatory)][string]$DownloadUrl,
     [Parameter(Mandatory)][string]$PrivateKeyFile,
+    [Parameter(Mandatory)][string]$PublicKey,
     # The version WinSparkle COMPARES (e.g. "1.0.4.4217"). Defaults to $Version.
     # $Version itself is only the human-facing shortVersionString.
     [string]$BuildVersion,
@@ -45,9 +46,18 @@ foreach ($p in @($InstallerPath, $PrivateKeyFile, $Tool)) {
     if (-not (Test-Path $p)) { throw "Not found: $p" }
 }
 
+$derivedPublicKey = (& $Tool public-key --private-key-file $PrivateKeyFile |
+    Where-Object { $_ -match '^Public key: ' } |
+    Select-Object -First 1) -replace '^Public key: ', ''
+if ([string]::IsNullOrWhiteSpace($derivedPublicKey) -or $derivedPublicKey -cne $PublicKey.Trim()) {
+    throw 'Ed25519 private key does not match the public key embedded in the application.'
+}
+
 # Ed25519-sign the installer (winsparkle-tool prints the base64 signature).
 $signature = (& $Tool sign --private-key-file $PrivateKeyFile $InstallerPath | Select-Object -Last 1).Trim()
 if ([string]::IsNullOrWhiteSpace($signature)) { throw "winsparkle-tool produced no signature." }
+& $Tool verify --public-key $PublicKey.Trim() --signature $signature $InstallerPath
+if ($LASTEXITCODE -ne 0) { throw 'winsparkle-tool rejected the generated installer signature.' }
 
 $length  = (Get-Item $InstallerPath).Length
 $pubDate = (Get-Date).ToUniversalTime().ToString('ddd, dd MMM yyyy HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) + ' +0000'

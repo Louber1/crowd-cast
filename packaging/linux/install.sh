@@ -10,9 +10,8 @@
 # plus the ONE privileged step: ensure the user is in the `input` group (evdev capture).
 #
 # Usage (production):
-#   curl -fsSL https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh | bash
-# Usage (dev channel):
-#   curl -fsSL https://raw.githubusercontent.com/p-doom/crowd-cast/linux-compat/packaging/linux/install.sh | bash -s -- --channel dev
+#   Download install-linux.sh from the selected linux-v... production release,
+#   inspect it, then run: bash install-linux.sh
 # Usage (dev/test, from a checkout):
 #   packaging/linux/install.sh --local
 #   packaging/linux/install.sh --uninstall

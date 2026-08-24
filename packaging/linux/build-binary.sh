@@ -9,7 +9,7 @@
 # Driven by packaging/linux/run-build-binary.sh — do NOT run on the host (that defeats the floor).
 set -euo pipefail
 
-ABI="${CROWD_CAST_OBS_ABI:-32.0.2}"
+ABI="${CROWD_CAST_OBS_ABI:?CROWD_CAST_OBS_ABI is required}"
 BUNDLE_TZST="/out/obs-bundle-${ABI}-x86_64.tar.zst"
 [ -f "$BUNDLE_TZST" ] || { echo "error: missing bundle $BUNDLE_TZST — run packaging/linux/run-build.sh first" >&2; exit 1; }
 
@@ -19,20 +19,25 @@ tar --zstd -xf "$BUNDLE_TZST" -C "$BDIR"
 export LIBOBS_PATH="$BDIR/usr/lib"
 [ -e "$LIBOBS_PATH/libobs.so" ] || { echo "error: no libobs.so under $LIBOBS_PATH" >&2; exit 1; }
 
-# Build-time config. Dev placeholders unless the caller overrides — a LOCAL floor build is for
-# portability validation, not a signed release (the GH workflow passes the real secrets + feed URL).
-export CROWD_CAST_API_GATEWAY_URL="${CROWD_CAST_API_GATEWAY_URL:-https://placeholder.invalid/prod/presign}"
+: "${CROWD_CAST_API_GATEWAY_URL:?CROWD_CAST_API_GATEWAY_URL is required}"
+: "${CROWD_CAST_BUILD_NUMBER:?CROWD_CAST_BUILD_NUMBER is required}"
+: "${CROWD_CAST_UPDATE_FEED_URL:?CROWD_CAST_UPDATE_FEED_URL is required}"
+: "${CROWD_CAST_UPDATE_PUBKEY:?CROWD_CAST_UPDATE_PUBKEY is required}"
+: "${CROWD_CAST_GOOGLE_CLIENT_ID:?CROWD_CAST_GOOGLE_CLIENT_ID is required}"
+: "${CROWD_CAST_OBS_BUNDLE_MANIFEST_PATH:?CROWD_CAST_OBS_BUNDLE_MANIFEST_PATH is required}"
+: "${CROWD_CAST_OBS_BUNDLE_MANIFEST_SHA256:?CROWD_CAST_OBS_BUNDLE_MANIFEST_SHA256 is required}"
+[[ -f "$CROWD_CAST_OBS_BUNDLE_MANIFEST_PATH" ]] || { echo "error: OBS bundle manifest is missing" >&2; exit 1; }
+[[ "$(sha256sum "$CROWD_CAST_OBS_BUNDLE_MANIFEST_PATH" | cut -d' ' -f1)" == "$CROWD_CAST_OBS_BUNDLE_MANIFEST_SHA256" ]] \
+  || { echo "error: OBS bundle manifest SHA-256 mismatch" >&2; exit 1; }
 export CROWD_CAST_OBS_ABI="$ABI"
-# CROWD_CAST_BUILD_NUMBER / _UPDATE_FEED_URL / _UPDATE_PUBKEY / _GOOGLE_CLIENT_ID / _SECRET pass
-# through from the environment when set (the workflow sets them; local runs may leave them unset).
 
 cd /src
 # --locked: the source is mounted read-only, so Cargo.lock must not be rewritten.
 # Shipped binary: a plain build (no extra features) so it's byte-identical to a normal release build.
-cargo build --release --locked --bin crowd-cast-agent
+cargo build --release --locked --offline --bin crowd-cast-agent
 # Offline manifest signer: built here too (behind release-tools) so the CI host needs no Rust, no
 # GTK3, and no API-gateway env just to sign. A glibc-2.34 signer runs fine on the newer-glibc host.
-cargo build --release --locked --features release-tools --bin cc-sign-manifest
+cargo build --release --locked --offline --features release-tools --bin cc-sign-manifest
 
 TGT="${CARGO_TARGET_DIR:-/src/target}/release"
 install -Dm755 "$TGT/crowd-cast-agent" /out/crowd-cast-agent-x86_64

@@ -1,217 +1,359 @@
 name: Windows Release
 
-# Manual trigger (Actions tab → "Run workflow", or `gh workflow run windows-release.yml`).
-# No version bump needed: the marketing version comes from Cargo.toml, and the
-# AUTO build number (the workflow run number) makes every release look newer to
-# WinSparkle — so clients auto-update on each release, exactly like macOS.
 on:
   workflow_dispatch:
     inputs:
       channel:
-        description: "dev = test build: prerelease, NO appcast publish (does not auto-update users); prod = real release"
+        description: Release authority and isolated update feed
         type: choice
-        options: [prod, dev]
-        default: prod
-      version_base:
-        description: "Marketing version (blank = Cargo.toml version)"
-        required: false
-        default: ""
-      allow_version_mismatch:
-        description: "Release even if macOS is on a different marketing version"
-        required: false
-        type: boolean
-        default: false
+        options: [dev, prod]
+        default: dev
 
 permissions:
-  contents: write   # create the GitHub Release
+  contents: write
+  id-token: write
+
+concurrency:
+  group: windows-release-${{ inputs.channel }}
+  cancel-in-progress: false
+
+env:
+  S3_BUCKET: crowd-cast-bucket
+  AWS_REGION: us-east-1
+  WINSPARKLE_URL: https://github.com/vslavik/winsparkle/releases/download/v0.9.3/WinSparkle-0.9.3.zip
+  WINSPARKLE_SHA256: 745985f41d2ab26b2d5a1cf87d76e4ed851039db19038e50610eb25ea0b73772
+  WINSPARKLE_SIZE: "27194631"
 
 jobs:
   release:
-    runs-on: windows-latest
+    runs-on: windows-2025
+    timeout-minutes: 90
+    environment:
+      name: crowd-cast-windows-${{ inputs.channel }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          targets: x86_64-pc-windows-msvc
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - name: Install Inno Setup
-        run: choco install innosetup --no-progress -y
-
-      - name: Resolve versions
-        id: ver
-        shell: pwsh
-        run: |
-          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          $base  = "${{ github.event.inputs.version_base }}"
-          if ([string]::IsNullOrWhiteSpace($base)) { $base = $cargo }
-          $build = "${{ github.run_number }}"
-          # dev builds get a distinct tag so they never collide with or shadow a prod win-v tag.
-          if ("${{ github.event.inputs.channel }}" -eq "dev") {
-            $tag = "win-dev-v$base+$build"
-          } else {
-            $tag = "win-v$base+$build"
-          }
-          "marketing=$base"           >> $env:GITHUB_OUTPUT
-          "build=$build"              >> $env:GITHUB_OUTPUT
-          "buildVersion=$base.$build" >> $env:GITHUB_OUTPUT
-          "tag=$tag"                  >> $env:GITHUB_OUTPUT
-
-      # Version guard: refuse to release Windows at a marketing version that differs
-      # from the latest macOS release, so the carried-forward dmg and the download
-      # buttons never advertise two different marketing versions at once. Override
-      # with the allow_version_mismatch input when the drift is intentional.
-      # Skipped for dev builds (they are prereleases and never become "latest").
-      - name: Check version alignment with macOS
-        if: ${{ github.event.inputs.channel != 'dev' }}
+      - name: Verify dispatch, source, and release authority
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_RUNNER_IMAGE_VERSION: ${{ vars.WINDOWS_RUNNER_IMAGE_VERSION }}
+          APPROVED_LIBOBS_REVISION: ${{ vars.APPROVED_LIBOBS_REVISION }}
         run: |
-          $repo = "${{ github.repository }}"
-          $win  = "${{ steps.ver.outputs.marketing }}"
-          # macOS releases are tagged v{marketing}-{build}; Windows are win-v{marketing}+{build}.
-          $macTag = gh release list --repo $repo --limit 40 --json tagName,createdAt |
-            ConvertFrom-Json | Sort-Object { [datetime]$_.createdAt } -Descending |
-            Where-Object { $_.tagName -match '^v\d+\.\d+\.\d+-' } |
-            Select-Object -First 1 -ExpandProperty tagName
-          if (-not $macTag) { Write-Host "No macOS release yet; skipping alignment check."; exit 0 }
-          $mac = ($macTag -replace '^v','') -replace '-.*$',''
-          if ($mac -eq $win) { Write-Host "Versions aligned: both at $win."; exit 0 }
-          $msg = "Version mismatch: releasing Windows $win while the latest macOS release is $mac."
-          if ("${{ github.event.inputs.allow_version_mismatch }}" -eq "true") {
-            Write-Host "::warning::$msg Proceeding because allow_version_mismatch=true."
-          } else {
-            Write-Error "$msg Release macOS $win first, or re-run with allow_version_mismatch=true."
-            exit 1
+          $ErrorActionPreference = 'Stop'
+          if ('${{ github.run_attempt }}' -ne '1') { throw 'Release reruns are forbidden; dispatch a new monotonic build.' }
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_RUNNER_IMAGE_VERSION)) { throw 'WINDOWS_RUNNER_IMAGE_VERSION is required.' }
+          if ($env:ImageVersion -cne $env:EXPECTED_RUNNER_IMAGE_VERSION) {
+            throw "Hosted runner image drift: expected $env:EXPECTED_RUNNER_IMAGE_VERSION, got $env:ImageVersion."
           }
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -cne '${{ github.sha }}') { throw "Checkout identity mismatch: $head" }
+          if (-not [string]::IsNullOrWhiteSpace((git status --porcelain))) { throw 'Release checkout is not clean.' }
 
-      - name: Build release binary + installer
+          $channel = '${{ inputs.channel }}'
+          if ('${{ github.ref }}' -cne 'refs/heads/main') { throw 'Release dispatch requires refs/heads/main.' }
+          $remoteMain = ((git ls-remote origin refs/heads/main) -split "`t")[0]
+          if ($remoteMain -cne '${{ github.sha }}') { throw "Release SHA is not current remote main: $remoteMain" }
+          $environment = gh api "repos/${{ github.repository }}/environments/crowd-cast-windows-$channel" | ConvertFrom-Json
+          if (@($environment.protection_rules).Count -eq 0) { throw 'Release environment has no protection rules.' }
+          if (-not $environment.deployment_branch_policy.protected_branches) {
+            throw 'Release environment must require protected branches.'
+          }
+          $immutableReleases = gh api 'repos/${{ github.repository }}/immutable-releases' | ConvertFrom-Json
+          if (-not $immutableReleases.enabled) { throw 'Repository immutable releases are not enabled.' }
+
+          if ($env:APPROVED_LIBOBS_REVISION -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'APPROVED_LIBOBS_REVISION must be the independently accepted 40-character commit.'
+          }
+          $cargo = Get-Content -LiteralPath Cargo.toml -Raw
+          $libobsLines = $cargo -split "`n" | Where-Object { $_ -match '^(libobs|libobs-wrapper|libobs-simple|libobs-bootstrapper|cargo-obs-build)\s*=' }
+          if ($libobsLines.Count -lt 4) { throw 'Expected libobs dependencies are missing.' }
+          $revisions = @()
+          foreach ($line in $libobsLines) {
+            if ($line -notmatch 'rev\s*=\s*"([0-9a-f]{40})"') { throw "Mutable libobs dependency: $line" }
+            $revisions += $Matches[1]
+          }
+          $unique = @($revisions | Sort-Object -Unique)
+          if ($unique.Count -ne 1 -or $unique[0] -cne $env:APPROVED_LIBOBS_REVISION) {
+            throw 'Cargo libobs pins do not equal the independently approved revision.'
+          }
+          if (Select-String -Path build.rs -Pattern 'cargo_obs_build::install' -Quiet) {
+            throw 'Mutable build-time OBS installation is still enabled.'
+          }
+          if (Select-String -Path src/capture/context.rs -Pattern 'ObsBootstrapperOptions::default|set_update\(' -Quiet) {
+            throw 'Runtime OBS bootstrap is not bound to one application manifest.'
+          }
+          throw 'Windows release is blocked until the signed installer bundles the exact OBS closure under protected installation ACLs; an in-process bootstrap receipt cannot authorize statically imported obs.dll.'
+
+      - uses: dtolnay/rust-toolchain@839ed2261f110eedd370cb037b6038e074512c4e # 1.91.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Record exact toolchain
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          gh --version
+          aws --version
+
+      - name: Read back exact native bundle manifest and archive
+        id: native
+        shell: pwsh
+        env:
+          MANIFEST_URL: ${{ vars.CROWD_CAST_OBS_BUNDLE_MANIFEST_URL }}
+          MANIFEST_SHA256: ${{ vars.CROWD_CAST_OBS_BUNDLE_MANIFEST_SHA256 }}
+          APPROVED_LIBOBS_REVISION: ${{ vars.APPROVED_LIBOBS_REVISION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:MANIFEST_SHA256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Native manifest SHA-256 is not canonical.' }
+          if ($env:MANIFEST_URL -match '[^\x21-\x7e]') {
+            throw 'Native manifest URL contains forbidden characters.'
+          }
+          $manifestUri = [uri]$env:MANIFEST_URL
+          if ($manifestUri.Scheme -ne 'https' -or $manifestUri.UserInfo -or $manifestUri.Query -or $manifestUri.Fragment) {
+            throw 'Native manifest URL must be exact HTTPS without credentials, query, or fragment.'
+          }
+          $manifestPath = Join-Path $env:RUNNER_TEMP 'obs-bundle-manifest.json'
+          Invoke-WebRequest -Uri $manifestUri -OutFile $manifestPath -UseBasicParsing -MaximumRedirection 0 -SslProtocol Tls12
+          $summaryPath = Join-Path $env:RUNNER_TEMP 'obs-bundle-summary.json'
+          python scripts/verify-obs-bundle-manifest.py `
+            --manifest $manifestPath `
+            --manifest-sha256 $env:MANIFEST_SHA256 `
+            --platform windows `
+            --arch x86_64 `
+            --approved-libobs-revision $env:APPROVED_LIBOBS_REVISION `
+            --summary-out $summaryPath
+          if ($LASTEXITCODE -ne 0) { throw 'Native manifest validation failed.' }
+          $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+          $bundleUri = [uri]$summary.bundle_url
+          $bundlePath = Join-Path $env:RUNNER_TEMP 'obs-bundle.7z'
+          Invoke-WebRequest -Uri $bundleUri -OutFile $bundlePath -UseBasicParsing -MaximumRedirection 0 -SslProtocol Tls12
+          python scripts/verify-obs-bundle-manifest.py `
+            --manifest $manifestPath `
+            --manifest-sha256 $env:MANIFEST_SHA256 `
+            --platform windows `
+            --arch x86_64 `
+            --approved-libobs-revision $env:APPROVED_LIBOBS_REVISION `
+            --bundle $bundlePath `
+            --summary-out $summaryPath
+          if ($LASTEXITCODE -ne 0) { throw 'Native archive validation failed.' }
+          "CROWD_CAST_OBS_BUNDLE_ARCHIVE_PATH=$bundlePath" >> $env:GITHUB_ENV
+          "CROWD_CAST_OBS_BUNDLE_MANIFEST_PATH=$manifestPath" >> $env:GITHUB_ENV
+          "CROWD_CAST_OBS_BUNDLE_MANIFEST_SHA256=$($summary.manifest_sha256)" >> $env:GITHUB_ENV
+          "manifest_sha256=$($summary.manifest_sha256)" >> $env:GITHUB_OUTPUT
+          "bundle_sha256=$($summary.bundle_sha256)" >> $env:GITHUB_OUTPUT
+          "bundle_size=$($summary.bundle_size)" >> $env:GITHUB_OUTPUT
+          "implementation_id=$($summary.implementation_id)" >> $env:GITHUB_OUTPUT
+
+      - name: Resolve monotonic release identity
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_ID_FLOOR: ${{ vars.BUILD_ID_FLOOR }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Cargo version is not release SemVer: $version" }
+          $build = [UInt64]'${{ github.run_number }}'
+          if ($build -eq 0) { throw 'Build number must be positive.' }
+          if ($env:BUILD_ID_FLOOR -cnotmatch '^(0|[1-9][0-9]*)$') { throw 'BUILD_ID_FLOOR must be a canonical non-negative integer.' }
+          $floor = [UInt64]$env:BUILD_ID_FLOOR
+          if ($build -le $floor) { throw 'Build identity does not exceed the protected migration floor.' }
+          $channel = '${{ inputs.channel }}'
+          $tag = if ($channel -eq 'prod') { "windows-v$version+$build" } else { "windows-dev-v$version+$build" }
+          $feedKey = if ($channel -eq 'prod') { 'appcast-win.xml' } else { 'appcast-win-dev.xml' }
+          $feedUrl = "https://$env:S3_BUCKET.s3.amazonaws.com/$feedKey"
+          if (git ls-remote origin "refs/tags/$tag") { throw "Remote tag already exists: $tag" }
+          $previousNativeErrorMode = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $tag --repo '${{ github.repository }}' *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+          $PSNativeCommandUseErrorActionPreference = $previousNativeErrorMode
+          if ($releaseExists) { throw "GitHub release already exists: $tag" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "build=$build" >> $env:GITHUB_OUTPUT
+          "build_version=$version.$build" >> $env:GITHUB_OUTPUT
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "feed_key=$feedKey" >> $env:GITHUB_OUTPUT
+          "feed_url=$feedUrl" >> $env:GITHUB_OUTPUT
+
+      - name: Fetch locked Rust dependencies
+        shell: pwsh
+        run: cargo fetch --locked
+
+      - name: Build release binary and installer from exact tools
         shell: pwsh
         env:
           CROWD_CAST_API_GATEWAY_URL: ${{ secrets.CROWD_CAST_API_GATEWAY_URL }}
           CROWD_CAST_GOOGLE_CLIENT_ID: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_ID }}
-          CROWD_CAST_GOOGLE_CLIENT_SECRET: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_SECRET }}
-          # dev: bake an empty appcast URL so the test build's updater is inert (build.rs only
-          # wires WinSparkle when this is non-empty) — the test build never self-updates.
-          CROWD_CAST_APPCAST_URL: ${{ github.event.inputs.channel == 'dev' && '' || 'https://crowd-cast-bucket.s3.amazonaws.com/appcast-win.xml' }}
+          CROWD_CAST_APPCAST_URL: ${{ steps.release.outputs.feed_url }}
           CROWD_CAST_ED_PUBLIC_KEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
-          # Auto build number → comparable version = {marketing}.{run_number}
-          CROWD_CAST_VERSION_BASE: ${{ steps.ver.outputs.marketing }}
-          CROWD_CAST_BUILD_NUMBER: ${{ steps.ver.outputs.build }}
-        run: pwsh scripts/build-windows-installer.ps1 -Version "${{ steps.ver.outputs.marketing }}"
+          CROWD_CAST_VERSION_BASE: ${{ steps.release.outputs.version }}
+          CROWD_CAST_BUILD_NUMBER: ${{ steps.release.outputs.build }}
+          CROWD_CAST_UPLOAD_TEST: ${{ inputs.channel == 'dev' && '1' || '' }}
+        run: |
+          pwsh scripts/build-windows-installer.ps1 `
+            -Version '${{ steps.release.outputs.version }}' `
+            -Iscc '${{ vars.INNO_SETUP_ISCC_PATH }}' `
+            -IsccSha256 '${{ vars.INNO_SETUP_ISCC_SHA256 }}' `
+            -WinSparkleUrl $env:WINSPARKLE_URL `
+            -WinSparkleSha256 $env:WINSPARKLE_SHA256 `
+            -WinSparkleSize $env:WINSPARKLE_SIZE
 
-      # Authenticode-sign the installer via Azure Trusted Signing. MUST run before the
-      # Ed25519/appcast step below: that step hashes the final .exe bytes, and signing
-      # appends a signature, so signing afterwards would make WinSparkle reject the
-      # download on a length/signature mismatch. The service-principal creds must go
-      # through the action's own auth INPUTS (azure-*): the action maps those to
-      # action-scoped env vars that the signing subprocess inherits. Step-level env: is
-      # NOT seen by that subprocess (DefaultAzureCredential then fails "not configured").
-      - name: Authenticode-sign the installer (Azure Trusted Signing)
-        uses: azure/artifact-signing-action@v2
+      - uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
         with:
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          endpoint: https://weu.codesigning.azure.net/
-          signing-account-name: crowdcastsign
-          certificate-profile-name: crowdcast-public
-          files-folder: ${{ github.workspace }}/dist
-          files-folder-filter: exe
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Authenticode-sign installer with environment OIDC authority
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_CERTIFICATE_PROFILE }}
+          files: ${{ github.workspace }}/dist/crowd-cast-setup.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+          cache-dependencies: false
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
 
-      - name: Sign installer + generate appcast
+      - name: Clear Azure signing session
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          az logout
+          az account clear
+
+      - name: Verify Authenticode and generate exact appcast
+        id: artifact
         shell: pwsh
         env:
           ED_PRIVATE_KEY: ${{ secrets.CROWD_CAST_ED_PRIVATE_KEY }}
+          ED_PUBLIC_KEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
+          EXPECTED_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT }}
         run: |
-          $v   = "${{ steps.ver.outputs.marketing }}"
-          $bv  = "${{ steps.ver.outputs.buildVersion }}"
-          $tag = "${{ steps.ver.outputs.tag }}"
-          $installer = "dist/crowd-cast-setup.exe"
-          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/crowd-cast-setup.exe"
+          $ErrorActionPreference = 'Stop'
+          $installer = 'dist/crowd-cast-setup.exe'
+          $authenticode = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($authenticode.Status -ne 'Valid') { throw "Invalid Authenticode status: $($authenticode.Status)" }
+          if ($env:EXPECTED_CERTIFICATE_THUMBPRINT -cnotmatch '^[0-9A-Fa-f]{40,64}$') { throw 'Signing certificate thumbprint is not configured.' }
+          if ($authenticode.SignerCertificate.Thumbprint -cne $env:EXPECTED_CERTIFICATE_THUMBPRINT.ToUpperInvariant()) {
+            throw "Unexpected signing certificate: $($authenticode.SignerCertificate.Thumbprint)"
+          }
           $keyFile = Join-Path $env:RUNNER_TEMP 'ed25519.key'
           [System.IO.File]::WriteAllText($keyFile, $env:ED_PRIVATE_KEY, (New-Object System.Text.UTF8Encoding($false)))
           try {
-            pwsh scripts/generate-appcast-win.ps1 -InstallerPath $installer -Version $v -BuildVersion $bv -DownloadUrl $url -PrivateKeyFile $keyFile -OutFile dist/appcast-win.xml
+            pwsh scripts/generate-appcast-win.ps1 `
+              -InstallerPath $installer `
+              -Version '${{ steps.release.outputs.version }}' `
+              -BuildVersion '${{ steps.release.outputs.build_version }}' `
+              -DownloadUrl 'https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}/crowd-cast-setup.exe' `
+              -PrivateKeyFile $keyFile `
+              -PublicKey $env:ED_PUBLIC_KEY `
+              -OutFile dist/appcast-win.xml
           } finally {
-            Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $keyFile -Force -ErrorAction SilentlyContinue
           }
+          $sha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item -LiteralPath $installer).Length
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          "size=$size" >> $env:GITHUB_OUTPUT
 
-      # Carry the current macOS installer forward into this release. The download
-      # buttons use /releases/latest/download/..., and this Windows release becomes
-      # "Latest", so without the dmg here the macOS button 404s whenever Windows
-      # shipped most recently. We copy the dmg from the most recent release that has
-      # one (the latest macOS build, or the carried copy from the previous Windows
-      # release). The macOS Sparkle appcast still points at its own immutable asset,
-      # so auto-update is untouched; this is purely the human download.
-      - name: Carry forward the latest macOS download (CrowdCast.dmg)
-        if: ${{ github.event.inputs.channel != 'dev' }}
+      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Reserve exact release identity before publication
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reservation = Join-Path $env:RUNNER_TEMP 'release-reservation.json'
+          [System.IO.File]::WriteAllText($reservation, (@{
+            schema = 'crowd-cast-release-reservation-v1'
+            platform = 'windows'
+            channel = '${{ steps.release.outputs.channel }}'
+            build = [UInt64]'${{ steps.release.outputs.build }}'
+            commit = '${{ github.sha }}'
+            run_id = '${{ github.run_id }}'
+          } | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+          $versioning = aws s3api get-bucket-versioning --bucket $env:S3_BUCKET --query Status --output text
+          if ($versioning -cne 'Enabled') { throw 'S3 bucket versioning must be Enabled.' }
+          aws s3api put-object --bucket $env:S3_BUCKET --key 'release-ledger/windows/${{ steps.release.outputs.channel }}/${{ steps.release.outputs.build }}/reservation.json' --body $reservation --if-none-match '*' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Release identity reservation failed.' }
+
+      - name: Publish and read back exact GitHub release asset
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Best-effort: never fail the release over the carried download.
-          $repo = "${{ github.repository }}"
-          $dmgTag = $null
-          try {
-            $tags = (gh release list --repo $repo --limit 40 --json tagName,createdAt |
-              ConvertFrom-Json | Sort-Object { [datetime]$_.createdAt } -Descending).tagName
-            foreach ($t in $tags) {
-              $names = (gh release view $t --repo $repo --json assets | ConvertFrom-Json).assets.name
-              if ($names -contains 'CrowdCast.dmg') { $dmgTag = $t; break }
-            }
-            if ($dmgTag) {
-              gh release download $dmgTag --repo $repo --pattern 'CrowdCast.dmg' --dir dist
-              Write-Host "Carried forward CrowdCast.dmg from $dmgTag"
-            } else {
-              Write-Host "No macOS CrowdCast.dmg found yet; shipping Windows-only (mac button stays 404 until macOS releases)."
-            }
-          } catch {
-            Write-Host "Carry-forward skipped (non-fatal): $_"
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ steps.release.outputs.tag }}'
+          $title = "crowd-cast Windows ${{ steps.release.outputs.version }} build ${{ steps.release.outputs.build }} (${{ inputs.channel }})"
+          $arguments = @('release', 'create', $tag, 'dist/crowd-cast-setup.exe', '--repo', '${{ github.repository }}', '--target', '${{ github.sha }}', '--title', $title, '--latest=false')
+          if ('${{ inputs.channel }}' -eq 'dev') { $arguments += '--prerelease' }
+          gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release creation failed.' }
+          $release = gh api 'repos/${{ github.repository }}/releases/tags/${{ steps.release.outputs.tag }}' | ConvertFrom-Json
+          if ($release.target_commitish -cne '${{ github.sha }}') { throw 'GitHub release target SHA mismatch.' }
+          if (-not $release.immutable) { throw 'Repository immutable releases must be enabled.' }
+          if ([bool]$release.prerelease -ne ('${{ inputs.channel }}' -eq 'dev')) { throw 'GitHub prerelease state mismatch.' }
+          if (@($release.assets).Count -ne 1 -or $release.assets[0].name -cne 'crowd-cast-setup.exe') { throw 'GitHub release asset set mismatch.' }
+          if ([UInt64]$release.assets[0].size -ne [UInt64]'${{ steps.artifact.outputs.size }}') { throw 'GitHub asset size mismatch.' }
+          $readback = Join-Path $env:RUNNER_TEMP 'crowd-cast-setup-readback.exe'
+          gh release download $tag --repo '${{ github.repository }}' --pattern 'crowd-cast-setup.exe' --output $readback
+          $sha = (Get-FileHash -LiteralPath $readback -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -cne '${{ steps.artifact.outputs.sha256 }}') { throw 'GitHub asset readback SHA-256 mismatch.' }
+
+      - name: Publish immutable release receipt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $receipt = Join-Path $env:RUNNER_TEMP 'release-receipt.json'
+          [System.IO.File]::WriteAllText($receipt, ([ordered]@{
+            schema = 'crowd-cast-release-receipt-v1'
+            platform = 'windows'
+            channel = '${{ inputs.channel }}'
+            version = '${{ steps.release.outputs.version }}'
+            build = [UInt64]'${{ steps.release.outputs.build }}'
+            commit = '${{ github.sha }}'
+            runner_image = "$env:ImageOS/$env:ImageVersion"
+            libobs_manifest_sha256 = '${{ steps.native.outputs.manifest_sha256 }}'
+            libobs_implementation_id = '${{ steps.native.outputs.implementation_id }}'
+            installer = [ordered]@{ name = 'crowd-cast-setup.exe'; size = [UInt64]'${{ steps.artifact.outputs.size }}'; sha256 = '${{ steps.artifact.outputs.sha256 }}' }
+          } | ConvertTo-Json -Depth 4 -Compress), (New-Object System.Text.UTF8Encoding($false)))
+          $key = 'release-ledger/windows/${{ inputs.channel }}/${{ steps.release.outputs.build }}/receipt.json'
+          aws s3api put-object --bucket $env:S3_BUCKET --key $key --body $receipt --content-type application/json --if-none-match '*' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Immutable release receipt upload failed.' }
+          $readback = Join-Path $env:RUNNER_TEMP 'release-receipt-readback.json'
+          aws s3api get-object --bucket $env:S3_BUCKET --key $key $readback | Out-Null
+          if ((Get-FileHash $receipt -Algorithm SHA256).Hash -cne (Get-FileHash $readback -Algorithm SHA256).Hash) {
+            throw 'Immutable release receipt readback mismatch.'
           }
-          exit 0
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: ${{ github.event.inputs.channel == 'dev' && format('v{0} (cross-platform test)', steps.ver.outputs.marketing) || format('v{0}', steps.ver.outputs.marketing) }}
-          # dev = prerelease: excluded from /releases/latest, so the docs download
-          # buttons keep pointing at the current prod release.
-          prerelease: ${{ github.event.inputs.channel == 'dev' }}
-          body: |
-            ## Installation
-
-            Please refer to the [quickstart guide](https://pdoom.org/crowd-cast-quickstart.html) for installation instructions.
-
-            ## What's changed
-            <!-- Add the user-facing changes for this release. -->
-          # CrowdCast.dmg is carried forward (above) and may be absent on a very
-          # first release, so do not fail if it is missing.
-          fail_on_unmatched_files: false
-          files: |
-            dist/crowd-cast-setup.exe
-            dist/CrowdCast.dmg
-
-      - name: Configure AWS credentials
-        # dev builds never publish an appcast, so no AWS access is needed.
-        if: ${{ github.event.inputs.channel != 'dev' }}
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
-      # Publish the appcast LAST — once it's live, clients start updating, so the
-      # release asset (previous step) must already exist for the download URL.
-      # SKIPPED for dev builds: this is the only step that triggers auto-update,
-      # so a dev build reaches no existing user.
-      - name: Publish appcast to S3
-        if: ${{ github.event.inputs.channel != 'dev' }}
-        # no-cache so WinSparkle/WinINet always revalidates the appcast and never
-        # serves a stale version that hides a freshly published release.
-        run: aws s3 cp dist/appcast-win.xml s3://crowd-cast-bucket/appcast-win.xml --cache-control "no-cache"
+      - name: Publish feed pointer last with rollback
+        shell: bash
+        run: |
+          scripts/publish-s3-pointer.sh \
+            --bucket "$S3_BUCKET" \
+            --pointer-key '${{ steps.release.outputs.feed_key }}' \
+            --archive-key 'release-feed-archive/windows/${{ inputs.channel }}/${{ steps.release.outputs.tag }}/appcast-win.xml' \
+            --file dist/appcast-win.xml \
+            --content-type application/xml

@@ -9,7 +9,7 @@ DOWNLOAD_URL_PREFIX="${CROWD_CAST_SPARKLE_ARCHIVE_BASE_URL:-}"
 RELEASE_NOTES_URL_PREFIX="${CROWD_CAST_SPARKLE_RELEASE_NOTES_URL_PREFIX:-}"
 FULL_RELEASE_NOTES_URL="${CROWD_CAST_SPARKLE_FULL_RELEASE_NOTES_URL:-}"
 PRODUCT_LINK="${CROWD_CAST_SPARKLE_PRODUCT_LINK:-}"
-PRIVATE_ED_KEY_FILE="${CROWD_CAST_SPARKLE_PRIVATE_ED_KEY_FILE:-}"
+EXPECTED_PUBLIC_ED_KEY="${CROWD_CAST_SPARKLE_PUBLIC_ED_KEY:-}"
 CHANNEL="${CROWD_CAST_SPARKLE_CHANNEL:-}"
 PHASED_ROLLOUT_INTERVAL="${CROWD_CAST_SPARKLE_PHASED_ROLLOUT_INTERVAL:-}"
 CRITICAL_UPDATE_VERSION="${CROWD_CAST_SPARKLE_CRITICAL_UPDATE_VERSION:-}"
@@ -23,7 +23,7 @@ Usage: scripts/generate-appcast.sh --archives-dir <dir> --download-url-prefix <u
 Options:
   --archives-dir <dir>              Directory containing Sparkle update archives
   --download-url-prefix <url>       Base URL used to download update archives
-  --ed-key-file <file>              Private EdDSA key file for Sparkle signing
+  --expected-public-ed-key <key>    Exact public key for the pre-provisioned Keychain key
   --release-notes-url-prefix <url>  Base URL for release notes sidecar files
   --full-release-notes-url <url>    Full release notes page URL
   --link <url>                      Product website link
@@ -39,7 +39,7 @@ Environment fallbacks:
   CROWD_CAST_SPARKLE_RELEASE_NOTES_URL_PREFIX
   CROWD_CAST_SPARKLE_FULL_RELEASE_NOTES_URL
   CROWD_CAST_SPARKLE_PRODUCT_LINK
-  CROWD_CAST_SPARKLE_PRIVATE_ED_KEY_FILE
+  CROWD_CAST_SPARKLE_PUBLIC_ED_KEY
   CROWD_CAST_SPARKLE_CHANNEL
   CROWD_CAST_SPARKLE_PHASED_ROLLOUT_INTERVAL
   CROWD_CAST_SPARKLE_CRITICAL_UPDATE_VERSION
@@ -57,8 +57,8 @@ while [[ $# -gt 0 ]]; do
             DOWNLOAD_URL_PREFIX="$2"
             shift 2
             ;;
-        --ed-key-file)
-            PRIVATE_ED_KEY_FILE="$2"
+        --expected-public-ed-key)
+            EXPECTED_PUBLIC_ED_KEY="$2"
             shift 2
             ;;
         --release-notes-url-prefix)
@@ -115,8 +115,8 @@ if [[ -z "$DOWNLOAD_URL_PREFIX" ]]; then
     exit 1
 fi
 
-if [[ -z "$PRIVATE_ED_KEY_FILE" ]]; then
-    echo "Missing --ed-key-file or CROWD_CAST_SPARKLE_PRIVATE_ED_KEY_FILE" >&2
+if [[ -z "$EXPECTED_PUBLIC_ED_KEY" ]]; then
+    echo "Missing --expected-public-ed-key or CROWD_CAST_SPARKLE_PUBLIC_ED_KEY" >&2
     exit 1
 fi
 
@@ -125,22 +125,25 @@ if [[ ! -d "$ARCHIVES_DIR" ]]; then
     exit 1
 fi
 
-if [[ ! -f "$PRIVATE_ED_KEY_FILE" ]]; then
-    echo "Private EdDSA key file not found: $PRIVATE_ED_KEY_FILE" >&2
-    exit 1
-fi
-
 "$PROJECT_ROOT/scripts/fetch-sparkle.sh" >/dev/null
 SPARKLE_DIR="$("$PROJECT_ROOT/scripts/fetch-sparkle.sh" --print-dir)"
 GENERATE_APPCAST="$SPARKLE_DIR/bin/generate_appcast"
+GENERATE_KEYS="$SPARKLE_DIR/bin/generate_keys"
 
-if [[ ! -x "$GENERATE_APPCAST" ]]; then
-    echo "Missing generate_appcast tool at $GENERATE_APPCAST" >&2
+[[ -x "$GENERATE_APPCAST" ]] || { echo "Missing generate_appcast tool at $GENERATE_APPCAST" >&2; exit 1; }
+[[ -x "$GENERATE_KEYS" ]] || { echo "Missing generate_keys tool at $GENERATE_KEYS" >&2; exit 1; }
+
+if [[ ! "$EXPECTED_PUBLIC_ED_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    echo "Expected Sparkle public key must be canonical base64 for 32 bytes." >&2
+    exit 1
+fi
+observed_key="$("$GENERATE_KEYS" -p | grep -Eo '[A-Za-z0-9+/]{43}=' | sort -u)"
+if [[ "$observed_key" != "$EXPECTED_PUBLIC_ED_KEY" ]]; then
+    echo "Pre-provisioned Sparkle signing key does not match the expected public key." >&2
     exit 1
 fi
 
 ARGS=(
-    --ed-key-file "$PRIVATE_ED_KEY_FILE"
     --download-url-prefix "$DOWNLOAD_URL_PREFIX"
     -o "$ARCHIVES_DIR/$OUTPUT_NAME"
 )

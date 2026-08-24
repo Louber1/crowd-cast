@@ -20,7 +20,16 @@
 param(
     [string]$ApiGatewayUrl = $env:CROWD_CAST_API_GATEWAY_URL,
     [string]$Version,
-    [string]$Iscc
+    [Parameter(Mandatory = $true)]
+    [string]$Iscc,
+    [Parameter(Mandatory = $true)]
+    [string]$IsccSha256,
+    [Parameter(Mandatory = $true)]
+    [uri]$WinSparkleUrl,
+    [Parameter(Mandatory = $true)]
+    [string]$WinSparkleSha256,
+    [Parameter(Mandatory = $true)]
+    [UInt64]$WinSparkleSize
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,18 +56,16 @@ $parts = $numeric.Split('.')
 while ($parts.Count -lt 4) { $parts += '0' }
 $versionInfo = ($parts[0..3]) -join '.'
 
-# Locate ISCC.
-if (-not $Iscc) {
-    $candidates = @(
-        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
-        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-    )
-    $Iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $Iscc) { $Iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source }
+if (-not (Test-Path -LiteralPath $Iscc -PathType Leaf)) {
+    throw "Exact ISCC.exe not found: $Iscc"
 }
-if (-not $Iscc -or -not (Test-Path $Iscc)) {
-    throw "ISCC.exe (Inno Setup 6) not found. Install it: winget install JRSoftware.InnoSetup"
+$IsccSha256 = $IsccSha256.Trim()
+if ($IsccSha256 -cnotmatch '^[0-9a-f]{64}$') {
+    throw 'ISCC SHA-256 must be 64 lowercase hexadecimal characters.'
+}
+$actualIsccSha256 = (Get-FileHash -LiteralPath $Iscc -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actualIsccSha256 -cne $IsccSha256) {
+    throw "ISCC SHA-256 mismatch: expected $IsccSha256, got $actualIsccSha256."
 }
 
 # Fetch the WinSparkle auto-update runtime; build.rs copies it next to the exe
@@ -66,15 +73,16 @@ if (-not $Iscc -or -not (Test-Path $Iscc)) {
 Write-Host "==> Fetching WinSparkle..." -ForegroundColor Cyan
 # Invoked as a PowerShell script (not an exe), so it throws on failure under
 # $ErrorActionPreference='Stop'; don't gate on $LASTEXITCODE (only set by exes).
-& (Join-Path $PSScriptRoot 'fetch-winsparkle.ps1')
+& (Join-Path $PSScriptRoot 'fetch-winsparkle.ps1') -Url $WinSparkleUrl -Sha256 $WinSparkleSha256 -Size $WinSparkleSize
 
 Write-Host "==> Building release binary (v$Version)..." -ForegroundColor Cyan
 $env:CROWD_CAST_API_GATEWAY_URL = $ApiGatewayUrl
-& cargo build --release
-if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed." }
+& cargo build --release --locked
+if ($LASTEXITCODE -ne 0) { throw "cargo build --release --locked failed." }
 if (-not (Test-Path $exePath)) { throw "Expected binary not found at $exePath." }
-# obs.dll is the loader the agent links against; it must ship so the process can
-# start (the rest of the OBS runtime is downloaded on first launch).
+# obs.dll is statically imported before Rust main and must exist for this build
+# helper to complete. The release workflow remains fail-closed until the signed
+# installer carries and verifies the entire exact OBS runtime closure.
 if (-not (Test-Path $obsDll)) { throw "obs.dll not found at $obsDll (expected from the libobs-rs build)." }
 # WinSparkle.dll is copied next to the exe by build.rs after fetch-winsparkle.
 if (-not (Test-Path $winSparkle)) { throw "WinSparkle.dll not found at $winSparkle (run scripts/fetch-winsparkle.ps1)." }
@@ -84,8 +92,7 @@ Write-Host "==> Compiling installer (ISCC)..." -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed." }
 
 $out = Join-Path $repoRoot "dist\crowd-cast-setup.exe"
-if (Test-Path $out) {
-    Write-Host "==> Installer built: $out" -ForegroundColor Green
-} else {
-    Write-Warning "ISCC reported success but $out was not found; check dist\."
+if (-not (Test-Path -LiteralPath $out -PathType Leaf)) {
+    throw "ISCC reported success but the installer was not produced: $out"
 }
+Write-Host "==> Installer built: $out" -ForegroundColor Green
