@@ -63,7 +63,12 @@ static SAMPLE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `linesize` is the plane stride, which OBS may pad beyond `width` — the padding bytes are
 /// undefined and must never be counted. Total, panic-free and allocation-free: it is called
 /// from the OBS video thread, where a panic would unwind across an FFI boundary (UB).
-fn black_pixel_counts(y_plane: &[u8], width: usize, height: usize, linesize: usize) -> (usize, usize) {
+fn black_pixel_counts(
+    y_plane: &[u8],
+    width: usize,
+    height: usize,
+    linesize: usize,
+) -> (usize, usize) {
     if width == 0 || height == 0 || linesize < width {
         return (0, 0);
     }

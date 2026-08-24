@@ -52,7 +52,10 @@ impl DisplayMonitor {
     pub fn new() -> Self {
         let ids = Self::get_display_ids();
         let dims = Self::get_display_dims(&ids);
-        debug!("DisplayMonitor initialized with displays: {:?} {:?}", ids, dims);
+        debug!(
+            "DisplayMonitor initialized with displays: {:?} {:?}",
+            ids, dims
+        );
         Self {
             last_display_ids: ids,
             last_display_dims: dims,

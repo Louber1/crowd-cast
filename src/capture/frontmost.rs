@@ -588,7 +588,10 @@ mod filter_self_tests {
     fn tray_shell_before_any_app_reports_none() {
         let mut last = None;
         let shell = app("explorer", 616);
-        assert_eq!(filter_self(Some(shell), OWN_PID, &TRAY_SHELL, &mut last), None);
+        assert_eq!(
+            filter_self(Some(shell), OWN_PID, &TRAY_SHELL, &mut last),
+            None
+        );
         assert_eq!(last, None);
     }
 
@@ -609,7 +612,10 @@ mod filter_self_tests {
     fn self_hidden_window_before_any_app_reports_none() {
         let mut last = None;
         let ours = app("crowd-cast-agent", OWN_PID);
-        assert_eq!(filter_self(Some(ours), OWN_PID, &OWN_HIDDEN, &mut last), None);
+        assert_eq!(
+            filter_self(Some(ours), OWN_PID, &OWN_HIDDEN, &mut last),
+            None
+        );
         assert_eq!(last, None);
     }
 

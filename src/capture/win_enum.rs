@@ -275,7 +275,10 @@ mod tests {
         assert_eq!(build_obs_id("a:b", "c#d", "e.exe"), "a#3Ab:c#22d:e.exe");
         // '#' is encoded BEFORE ':' — "#:" becomes "#22#3A", never "#22:" re-encoded.
         assert_eq!(build_obs_id("#:", "", "x.exe"), "#22#3A::x.exe");
-        assert_eq!(build_obs_id("Extrude", "NXToolWnd", "ugraf.exe"), "Extrude:NXToolWnd:ugraf.exe");
+        assert_eq!(
+            build_obs_id("Extrude", "NXToolWnd", "ugraf.exe"),
+            "Extrude:NXToolWnd:ugraf.exe"
+        );
     }
 
     /// The crash gate: untitled windows are never bindable, whatever else they look like.
@@ -334,7 +337,10 @@ mod tests {
     /// A foreground window of ANOTHER app must not hijack the selection.
     #[test]
     fn foreign_foreground_is_ignored() {
-        let cands = [win(1, "ugraf", 5, 800, 600), win(2, "firefox", 5, 1920, 1080)];
+        let cands = [
+            win(1, "ugraf", 5, 800, 600),
+            win(2, "firefox", 5, 1920, 1080),
+        ];
         let got = select_permissive_candidate(&cands, "ugraf", Some(2)).unwrap();
         assert_eq!(got.hwnd, 1);
     }

@@ -24,7 +24,7 @@ mod lv {
     use winapi::shared::minwindef::{LPARAM, WPARAM};
     use winapi::shared::windef::HWND;
     use winapi::um::commctrl::{
-        LVITEMW, LVIS_STATEIMAGEMASK, LVM_GETITEMSTATE, LVM_SETEXTENDEDLISTVIEWSTYLE,
+        LVIS_STATEIMAGEMASK, LVITEMW, LVM_GETITEMSTATE, LVM_SETEXTENDEDLISTVIEWSTYLE,
         LVM_SETITEMSTATE, LVM_SETTEXTCOLOR, LVS_EX_CHECKBOXES, LVS_EX_FULLROWSELECT,
     };
     use winapi::um::winuser::{
@@ -62,7 +62,11 @@ mod lv {
     /// A disabled report-view ListView custom-draws its rows and so does NOT
     /// grey them on its own, so we drive the text colour explicitly.
     pub unsafe fn set_greyed(hwnd: HWND, greyed: bool) {
-        let color = GetSysColor(if greyed { COLOR_GRAYTEXT } else { COLOR_WINDOWTEXT });
+        let color = GetSysColor(if greyed {
+            COLOR_GRAYTEXT
+        } else {
+            COLOR_WINDOWTEXT
+        });
         SendMessageW(hwnd, LVM_SETTEXTCOLOR, 0, color as LPARAM);
         InvalidateRect(hwnd, std::ptr::null(), 1);
     }
@@ -154,7 +158,8 @@ fn list_windowed_apps() -> Vec<(String, String)> {
     // app shouldn't be missing from the list just because its window happens to be
     // minimized or on another desktop at that instant. ExcludeMinimized would
     // hide, e.g., a minimized VS Code, making it look like the app isn't supported.
-    if let Ok(windows) = WindowCaptureSourceBuilder::get_windows(WindowSearchMode::IncludeMinimized) {
+    if let Ok(windows) = WindowCaptureSourceBuilder::get_windows(WindowSearchMode::IncludeMinimized)
+    {
         for w in windows {
             let exe = std::path::Path::new(&w.0.full_exe)
                 .file_stem()
@@ -482,7 +487,13 @@ pub struct AppPickerResult {
 /// Reuses the wizard's picker UI without the autostart row or `setup_completed`
 /// side effects; the caller persists and applies the returned selection.
 pub fn run_settings_panel(current_apps: &[String], capture_all: bool) -> Result<AppPickerResult> {
-    let outcome = run_app_picker("crowd-cast settings", current_apps, capture_all, false, false)?;
+    let outcome = run_app_picker(
+        "crowd-cast settings",
+        current_apps,
+        capture_all,
+        false,
+        false,
+    )?;
     info!(
         "Windows settings panel closed: saved={}, {} app(s), capture_all={}",
         outcome.saved,

@@ -101,8 +101,7 @@ fn create_shortcut(exe: &Path, lnk: &Path, icon: Option<&Path>) -> anyhow::Resul
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let result = (|| -> anyhow::Result<()> {
-                let link: IShellLinkW =
-                    CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+                let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
                 link.SetPath(&exe)?;
                 if let Some(icon) = &icon {
                     let _ = link.SetIconLocation(icon, 0);

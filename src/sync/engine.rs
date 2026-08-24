@@ -348,7 +348,6 @@ const BLIND_PROBE_STANDDOWN: Duration = Duration::from_secs(300);
 #[cfg(all(target_os = "macos", not(no_tray)))]
 const BLIND_ALERT_AFTER: Duration = Duration::from_secs(180);
 
-
 /// How recent an input event must be for "the user is actively working" to hold. This is the
 /// gate that keeps a locked screen, a stepped-away machine or an about-to-idle session from
 /// ever escalating: no input, no restart.
@@ -536,7 +535,10 @@ fn write_capture_dead_restart_map(map: &std::collections::HashMap<String, u64>) 
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let body: String = map.iter().map(|(app, ts)| format!("{app}\t{ts}\n")).collect();
+    let body: String = map
+        .iter()
+        .map(|(app, ts)| format!("{app}\t{ts}\n"))
+        .collect();
     let _ = std::fs::write(&path, body);
 }
 
@@ -2562,8 +2564,7 @@ unintended app video."
                 // machine that restarts on every display change would re-show the popup 180s
                 // into each new process for as long as the black state persists.
                 let alert_marker = format!("alerted:{marker_key}");
-                if !self.blind_alert_surfaced && capture_dead_restart_age(&alert_marker).is_none()
-                {
+                if !self.blind_alert_surfaced && capture_dead_restart_age(&alert_marker).is_none() {
                     self.blind_alert_surfaced = true;
                     note_capture_dead_restart(&alert_marker);
                     extern "C" {
@@ -2683,7 +2684,8 @@ unintended app video."
                 // alerted" state, or a partial wedge would restart-loop.
                 #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
                 {
-                    self.capture_dead_since.remove(watchdog.expected_app.as_str());
+                    self.capture_dead_since
+                        .remove(watchdog.expected_app.as_str());
                     self.capture_alerted_apps
                         .remove(watchdog.expected_app.as_str());
                     clear_capture_dead_restart(&watchdog.expected_app);
@@ -2746,7 +2748,10 @@ unintended app video."
                 // tick (restarted, or surfaced the restart-your-machine alert after a restart
                 // didn't help), stop here.
                 #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
-                if self.maybe_escalate_dead_source(&watchdog, surface_failure).await {
+                if self
+                    .maybe_escalate_dead_source(&watchdog, surface_failure)
+                    .await
+                {
                     self.schedule_capture_watchdog(&watchdog.expected_app, watchdog.attempt + 1);
                     self.refresh_capture_enabled_from_frontmost();
                     return;
@@ -2770,7 +2775,9 @@ unintended app video."
                         // Error status silences the ~1.6s EngineStatus::Error churn of a
                         // window-less period. All other refresh errors keep today's behavior.
                         #[cfg(target_os = "windows")]
-                        if e.downcast_ref::<crate::capture::NoCapturableWindow>().is_some() {
+                        if e.downcast_ref::<crate::capture::NoCapturableWindow>()
+                            .is_some()
+                        {
                             debug!(
                                 "No capturable window for '{}' yet; keeping the readiness probe \
                                  alive (attempt {})",
@@ -2953,7 +2960,8 @@ unintended app video."
         // (the latter catches a switch between two same-resolution monitors, which the source-dim
         // check alone would miss).
         let dims_changed = self.last_logged_source_dims != Some((w, h));
-        let display_changed = self.capture_ctx.active_display_uuid() != self.last_logged_active_display;
+        let display_changed =
+            self.capture_ctx.active_display_uuid() != self.last_logged_active_display;
         if dims_changed || display_changed {
             self.emit_metadata_event(self.current_capture_timestamp_us());
         }
@@ -4054,7 +4062,10 @@ unintended app video."
         // (a missed resume would drift — the bug we're fixing — whereas an extra restart is benign).
         if let Some(at) = self.last_resume_restart_at {
             if at.elapsed() < Duration::from_secs(10) {
-                debug!("Ignoring duplicate resume signal ({reason}); restarted {:?} ago", at.elapsed());
+                debug!(
+                    "Ignoring duplicate resume signal ({reason}); restarted {:?} ago",
+                    at.elapsed()
+                );
                 return;
             }
         }
@@ -5297,7 +5308,12 @@ mod tests {
         #[test]
         fn fresh_probe_when_no_memo() {
             assert_eq!(
-                cached_window_probe_verdict(&None, "ugraf", Instant::now(), NEEDS_SCENE_PROBE_MIN_GAP),
+                cached_window_probe_verdict(
+                    &None,
+                    "ugraf",
+                    Instant::now(),
+                    NEEDS_SCENE_PROBE_MIN_GAP
+                ),
                 None
             );
         }
@@ -5361,7 +5377,14 @@ mod tests {
         fn gates_close_once_input_goes_stale() {
             // A stepped-away machine legitimately shows black; only recent input makes black
             // video definitely wrong. Boundary is inclusive.
-            assert!(blind_gates_met(true, false, true, INPUT_RECENT, false, false));
+            assert!(blind_gates_met(
+                true,
+                false,
+                true,
+                INPUT_RECENT,
+                false,
+                false
+            ));
             assert!(!blind_gates_met(
                 true,
                 false,
