@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::pending_artifact::ArtifactSeal;
-use super::pending_security::{secure_sqlite_files, PrivateDirectory};
+use super::pending_security::{open_sqlite_sidecars, PrivateDirectory};
 use super::receipt_endpoint::trusted_endpoint_identity;
 
 #[path = "pending_legacy.rs"]
@@ -170,7 +170,7 @@ pub(crate) struct PendingUploadStore {
     connection: Arc<Mutex<Connection>>,
     data_dir: PrivateDirectory,
     output_dir: PrivateDirectory,
-    _database_file: Arc<File>,
+    _sqlite_files: Arc<Vec<File>>,
 }
 
 impl PendingUploadStore {
@@ -343,15 +343,17 @@ impl PendingUploadStore {
         } else if version != SCHEMA_VERSION {
             bail!("unsupported pending-upload schema version {version}; expected {SCHEMA_VERSION}");
         }
-        secure_sqlite_files(&data_dir, database_name)?;
+        let mut sqlite_files = Vec::with_capacity(3);
+        sqlite_files.push(database_file);
+        sqlite_files.extend(open_sqlite_sidecars(&data_dir, database_name)?);
         data_dir.sync()?;
-        data_dir.verify_entry(database_name, &database_file, "upload state database")?;
+        data_dir.verify_entry(database_name, &sqlite_files[0], "upload state database")?;
 
         let store = Self {
             connection: Arc::new(Mutex::new(connection)),
             data_dir,
             output_dir,
-            _database_file: Arc::new(database_file),
+            _sqlite_files: Arc::new(sqlite_files),
         };
         let legacy_path = store.data_dir.path().join("pending_uploads.json");
         store.import_legacy_manifest(&legacy_path, after_legacy_commit)?;

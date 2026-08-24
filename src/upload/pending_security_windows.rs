@@ -1,4 +1,4 @@
-use super::FileSnapshot;
+use super::{DirectoryEnumerationBudget, FileSnapshot};
 use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -165,6 +165,7 @@ impl Directory {
 
     pub(super) fn file_names(&self) -> Result<Vec<OsString>> {
         let mut names = Vec::new();
+        let mut budget = DirectoryEnumerationBudget::default();
         let mut restart = true;
         loop {
             let mut buffer = vec![0u8; 64 * 1024];
@@ -210,6 +211,7 @@ impl Directory {
                 let name =
                     unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_length / 2) };
                 if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                    budget.admit(name_length)?;
                     names.push(OsString::from_wide(name));
                 }
                 if entry.NextEntryOffset == 0 {

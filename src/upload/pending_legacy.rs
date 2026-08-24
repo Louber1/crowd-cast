@@ -169,6 +169,13 @@ mod tests {
             let output = root.join("recordings");
             std::fs::create_dir_all(&data).unwrap();
             std::fs::create_dir_all(&output).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for path in [&root, &data, &output] {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                }
+            }
             Self { root, data, output }
         }
 

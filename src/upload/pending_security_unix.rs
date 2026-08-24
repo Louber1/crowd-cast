@@ -1,10 +1,49 @@
-use super::FileSnapshot;
+use super::{DirectoryEnumerationBudget, FileSnapshot};
 use anyhow::{bail, Context, Result};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path};
+
+const MAX_PROCESS_DESCRIPTOR_ENTRIES: usize = 65_536;
+
+#[derive(Default)]
+struct ProcessDescriptorScan {
+    entries: usize,
+}
+
+impl ProcessDescriptorScan {
+    fn admit_entry(&mut self) -> Result<()> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .context("process descriptor entry count overflowed")?;
+        if self.entries > MAX_PROCESS_DESCRIPTOR_ENTRIES {
+            bail!("process descriptor table exceeds the SQLite attestation work limit");
+        }
+        Ok(())
+    }
+
+    fn parse_name(name: &OsStr) -> Result<RawFd> {
+        let bytes = name.as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > 10
+            || !bytes.iter().all(u8::is_ascii_digit)
+            || (bytes.len() > 1 && bytes[0] == b'0')
+        {
+            bail!("process descriptor table contains a non-canonical descriptor name");
+        }
+        let value = std::str::from_utf8(bytes)
+            .context("process descriptor name is not ASCII")?
+            .parse::<u64>()
+            .context("process descriptor name is outside the numeric range")?;
+        if value > RawFd::MAX as u64 {
+            bail!("process descriptor name exceeds the platform descriptor range");
+        }
+        Ok(value as RawFd)
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct Directory {
@@ -21,6 +60,7 @@ impl Directory {
                 Component::Normal(name) => name,
                 _ => bail!("unsupported private directory component in {path:?}"),
             };
+            validate_trusted_parent(&current, label)?;
             match open_directory_at(current.as_raw_fd(), name) {
                 Ok(next) => current = next,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -198,6 +238,7 @@ impl Directory {
             return Err(error).context("failed to enumerate private directory capability");
         }
         let mut names = Vec::new();
+        let mut budget = DirectoryEnumerationBudget::default();
         loop {
             set_errno(0);
             let entry = unsafe { libc::readdir(stream) };
@@ -214,6 +255,12 @@ impl Directory {
             }
             let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
             if bytes != b"." && bytes != b".." {
+                if let Err(error) = budget.admit(bytes.len()) {
+                    unsafe {
+                        libc::closedir(stream);
+                    }
+                    return Err(error);
+                }
                 names.push(OsString::from_vec(bytes.to_vec()));
             }
         }
@@ -232,13 +279,13 @@ impl Directory {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         compile_error!("SQLite custody requires process descriptor attestation on Unix");
         let mut count = 0usize;
+        let mut scan = ProcessDescriptorScan::default();
         for entry in std::fs::read_dir(descriptors)
             .context("failed to enumerate process descriptors for SQLite attestation")?
         {
             let entry = entry.context("failed to read process descriptor entry")?;
-            let Ok(descriptor) = entry.file_name().to_string_lossy().parse::<RawFd>() else {
-                continue;
-            };
+            scan.admit_entry()?;
+            let descriptor = ProcessDescriptorScan::parse_name(&entry.file_name())?;
             match snapshot_fd(descriptor, "process descriptor") {
                 Ok(snapshot) if snapshot.object_id == expected_object_id => count += 1,
                 Ok(_) => {}
@@ -276,6 +323,22 @@ impl Directory {
         }
         Ok(())
     }
+}
+
+fn validate_trusted_parent(directory: &File, label: &str) -> Result<()> {
+    let snapshot = snapshot_fd(directory.as_raw_fd(), label)?;
+    let current_user = unsafe { libc::geteuid() } as u64;
+    if snapshot.mode_or_attributes & libc::S_IFMT as u64 != libc::S_IFDIR as u64
+        || (snapshot.owner_id != 0 && snapshot.owner_id != current_user)
+    {
+        bail!("{label} path has a directory parent outside the trusted ownership boundary");
+    }
+    let writable_by_others = snapshot.mode_or_attributes & 0o022 != 0;
+    let sticky = snapshot.mode_or_attributes & libc::S_ISVTX as u64 != 0;
+    if writable_by_others && !sticky {
+        bail!("{label} path has a replaceable group/world-writable directory parent");
+    }
+    Ok(())
 }
 
 fn open_existing_directory(path: &Path) -> Result<File> {
@@ -399,5 +462,27 @@ fn snapshot_stat(status: libc::stat) -> FileSnapshot {
         modified: (status.st_mtime, status.st_mtime_nsec),
         changed: (status.st_ctime, status.st_ctime_nsec),
         mode_or_attributes: status.st_mode as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_scan_admission_is_exact_and_canonical() {
+        let mut scan = ProcessDescriptorScan::default();
+        for _ in 0..MAX_PROCESS_DESCRIPTOR_ENTRIES {
+            scan.admit_entry().unwrap();
+        }
+        assert!(scan.admit_entry().is_err());
+
+        for invalid in ["", "00", "-1", "1x", "2147483648", "12345678901"] {
+            assert!(ProcessDescriptorScan::parse_name(OsStr::new(invalid)).is_err());
+        }
+        assert_eq!(
+            ProcessDescriptorScan::parse_name(OsStr::new("2147483647")).unwrap(),
+            RawFd::MAX
+        );
     }
 }

@@ -19,6 +19,13 @@ mod tests {
             let output = root.join("recordings");
             std::fs::create_dir_all(&data).unwrap();
             std::fs::create_dir_all(&output).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for path in [&root, &data, &output] {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                }
+            }
             Self { root, data, output }
         }
 
@@ -386,6 +393,107 @@ mod tests {
         assert!(input_path.exists());
     }
 
+    #[cfg(unix)]
+    type ReplacementProtection = u32;
+    #[cfg(windows)]
+    type ReplacementProtection = Vec<u8>;
+
+    fn install_permissive_replacement(
+        _store: &PendingUploadStore,
+        artifact: &ArtifactSeal,
+    ) -> (PathBuf, ReplacementProtection) {
+        let original = artifact.path.with_extension("original");
+        std::fs::rename(&artifact.path, &original).unwrap();
+        std::fs::write(&artifact.path, b"replacement").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&artifact.path, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            (original, 0o644)
+        }
+        #[cfg(windows)]
+        {
+            let replacement = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&artifact.path)
+                .unwrap();
+            _store
+                .output_dir
+                .make_test_acl_permissive(&replacement)
+                .unwrap();
+            let acl = _store.output_dir.test_acl_bytes(&replacement).unwrap();
+            (original, acl)
+        }
+    }
+
+    fn assert_replacement_protection(
+        _store: &PendingUploadStore,
+        artifact: &ArtifactSeal,
+        expected: &ReplacementProtection,
+    ) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::symlink_metadata(&artifact.path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                *expected
+            );
+        }
+        #[cfg(windows)]
+        {
+            let replacement = std::fs::File::open(&artifact.path).unwrap();
+            assert_eq!(
+                _store.output_dir.test_acl_bytes(&replacement).unwrap(),
+                *expected
+            );
+        }
+    }
+
+    #[test]
+    fn received_completion_does_not_repair_or_delete_a_replacement() {
+        let paths = TestPaths::new("received-replacement");
+        let chunk_id = "session-a_seg0000";
+        paths.pair(chunk_id);
+        let store = PendingUploadStore::open(&paths.data, &paths.output).unwrap();
+        let entry = store.list_pending().unwrap().pop().unwrap();
+        store.record_receipt(&entry, &receipt_for(&entry)).unwrap();
+        let (original, protection) = install_permissive_replacement(&store, &entry.video);
+
+        store
+            .complete_received(chunk_id)
+            .expect_err("received completion must reject a replacement");
+
+        assert_replacement_protection(&store, &entry.video, &protection);
+        assert!(original.exists());
+        assert!(entry.input.path.exists());
+    }
+
+    #[test]
+    fn discard_completion_does_not_repair_or_delete_a_replacement() {
+        let paths = TestPaths::new("discard-replacement");
+        let chunk_id = "session-a_seg0000";
+        paths.pair(chunk_id);
+        let store = PendingUploadStore::open(&paths.data, &paths.output).unwrap();
+        let entry = store
+            .record_discard(chunk_id, PendingDiscard::UserPanic)
+            .unwrap();
+        let (original, protection) = install_permissive_replacement(&store, &entry.video);
+
+        store
+            .complete_discard_entry(&entry)
+            .expect_err("discard completion must reject a replacement");
+
+        assert_replacement_protection(&store, &entry.video, &protection);
+        assert!(original.exists());
+        assert!(entry.input.path.exists());
+    }
+
     #[test]
     fn corrupt_database_is_fatal() {
         let paths = TestPaths::new("corrupt");
@@ -500,6 +608,24 @@ mod tests {
                 & 0o077,
             0
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sqlite_database_and_sidecars_are_held_and_process_attested() {
+        let paths = TestPaths::new("sqlite-sidecar-attestation");
+        let store = PendingUploadStore::open(&paths.data, &paths.output).unwrap();
+
+        assert_eq!(store._sqlite_files.len(), 3);
+        for file in store._sqlite_files.iter() {
+            assert!(
+                store
+                    .data_dir
+                    .process_open_count(file, "upload state file")
+                    .unwrap()
+                    >= 2
+            );
+        }
     }
 
     #[cfg(unix)]

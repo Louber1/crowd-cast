@@ -4,6 +4,39 @@ use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+const MAX_PRIVATE_DIRECTORY_ENTRIES: usize = 65_536;
+const MAX_PRIVATE_FILENAME_BYTES: usize = 1_024;
+const MAX_PRIVATE_DIRECTORY_NAME_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct DirectoryEnumerationBudget {
+    entries: usize,
+    name_bytes: usize,
+}
+
+impl DirectoryEnumerationBudget {
+    pub(super) fn admit(&mut self, name_bytes: usize) -> Result<()> {
+        if name_bytes > MAX_PRIVATE_FILENAME_BYTES {
+            bail!("private directory entry name exceeds the custody limit");
+        }
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .context("private directory entry count overflowed")?;
+        if self.entries > MAX_PRIVATE_DIRECTORY_ENTRIES {
+            bail!("private directory exceeds the custody entry limit");
+        }
+        self.name_bytes = self
+            .name_bytes
+            .checked_add(name_bytes)
+            .context("private directory name-byte count overflowed")?;
+        if self.name_bytes > MAX_PRIVATE_DIRECTORY_NAME_BYTES {
+            bail!("private directory names exceed the custody work limit");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 #[path = "pending_security_unix.rs"]
 mod platform;
@@ -134,12 +167,12 @@ impl PrivateDirectory {
     }
 
     #[cfg(all(test, windows))]
-    fn make_test_acl_permissive(&self, file: &File) -> Result<()> {
+    pub(crate) fn make_test_acl_permissive(&self, file: &File) -> Result<()> {
         self.inner.make_test_acl_permissive(file)
     }
 
     #[cfg(all(test, windows))]
-    fn test_acl_bytes(&self, file: &File) -> Result<Vec<u8>> {
+    pub(crate) fn test_acl_bytes(&self, file: &File) -> Result<Vec<u8>> {
         self.inner.test_acl_bytes(file)
     }
 
@@ -172,8 +205,13 @@ impl PrivateDirectory {
     }
 
     pub(crate) fn contains_file(&self, name: &OsStr) -> Result<bool> {
-        match self.open_private_file(name, false, "private file") {
-            Ok(_) => Ok(true),
+        validate_leaf(name)?;
+        match self.inner.open_file(name, false, "private file") {
+            Ok(file) => {
+                self.inner.validate_private_file(&file, "private file")?;
+                self.verify_entry(name, &file, "private file")?;
+                Ok(true)
+            }
             Err(error) if is_not_found(&error) => Ok(false),
             Err(error) => Err(error),
         }
@@ -200,21 +238,25 @@ fn cleanup_lock() -> &'static Mutex<()> {
     CLEANUP_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-pub(crate) fn secure_sqlite_files(
+pub(crate) fn open_sqlite_sidecars(
     directory: &PrivateDirectory,
     database_name: &OsStr,
-) -> Result<()> {
-    directory.open_private_file(database_name, true, "upload state database")?;
+) -> Result<Vec<File>> {
     let database = database_name.to_string_lossy();
+    let mut files = Vec::with_capacity(2);
     for suffix in ["-wal", "-shm"] {
         let sidecar = OsString::from(format!("{database}{suffix}"));
-        match directory.open_private_file(&sidecar, true, "upload state sidecar") {
-            Ok(_) => {}
-            Err(error) if is_not_found(&error) => {}
-            Err(error) => return Err(error),
+        let file = directory
+            .open_private_file(&sidecar, true, "upload state sidecar")
+            .with_context(|| format!("missing required SQLite sidecar {sidecar:?}"))?;
+        directory.verify_entry(&sidecar, &file, "upload state sidecar")?;
+        #[cfg(unix)]
+        if directory.process_open_count(&file, "upload state sidecar")? < 2 {
+            bail!("SQLite did not open held upload state sidecar {sidecar:?}");
         }
+        files.push(file);
     }
-    Ok(())
+    Ok(files)
 }
 
 fn normalized_absolute_path(path: &Path) -> Result<PathBuf> {
@@ -305,7 +347,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn intermediate_symlink_is_rejected() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         let root = std::env::temp_dir().join(format!(
             "crowd-cast-private-link-{}-{}",
@@ -314,6 +356,7 @@ mod tests {
         ));
         let target = root.join("target");
         std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         symlink(&target, root.join("link")).unwrap();
 
         let error = PrivateDirectory::open_or_create(&root.join("link/child"), "test")
@@ -529,6 +572,46 @@ mod tests {
 
         drop(directory);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_enumeration_budget_is_exact() {
+        let mut budget = DirectoryEnumerationBudget::default();
+        for _ in 0..MAX_PRIVATE_DIRECTORY_ENTRIES {
+            budget.admit(1).unwrap();
+        }
+        assert!(budget.admit(1).is_err());
+
+        let mut budget = DirectoryEnumerationBudget::default();
+        assert!(budget.admit(MAX_PRIVATE_FILENAME_BYTES + 1).is_err());
+
+        let mut budget = DirectoryEnumerationBudget::default();
+        for _ in 0..(MAX_PRIVATE_DIRECTORY_NAME_BYTES / MAX_PRIVATE_FILENAME_BYTES) {
+            budget.admit(MAX_PRIVATE_FILENAME_BYTES).unwrap();
+        }
+        assert!(budget.admit(1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaceable_parent_is_rejected_before_creating_custody() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-parent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        let error = PrivateDirectory::open_or_create(&root.join("state"), "test")
+            .expect_err("a non-sticky writable parent must be rejected");
+
+        assert!(format!("{error:#}").contains("replaceable group/world-writable"));
+        assert!(!root.join("state").exists());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[cfg(unix)]
