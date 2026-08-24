@@ -11,6 +11,9 @@ use super::pending_artifact::ArtifactSeal;
 use super::pending_security::{secure_sqlite_files, PrivateDirectory};
 use super::receipt_endpoint::trusted_endpoint_identity;
 
+#[path = "pending_legacy.rs"]
+mod legacy;
+
 const SCHEMA_VERSION: i64 = 1;
 pub(crate) const UPLOAD_RECEIPT_CONTRACT_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 128;
@@ -172,6 +175,14 @@ pub(crate) struct PendingUploadStore {
 
 impl PendingUploadStore {
     pub(crate) fn open(data_dir: &Path, output_dir: &Path) -> Result<Self> {
+        Self::open_with_legacy_hook(data_dir, output_dir, || Ok(()))
+    }
+
+    fn open_with_legacy_hook(
+        data_dir: &Path,
+        output_dir: &Path,
+        after_legacy_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         let data_dir = PrivateDirectory::open_or_create(data_dir, "upload state")?;
         let output_dir = PrivateDirectory::open_or_create(output_dir, "recording")?;
         let database_name = OsStr::new("pending_uploads.sqlite3");
@@ -317,6 +328,11 @@ impl PendingUploadStore {
                         (state = 'discarding' AND receipt_id IS NULL AND discard_id IS NOT NULL)
                     )
                 );
+                CREATE TABLE migrations (
+                    name TEXT PRIMARY KEY NOT NULL,
+                    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+                    imported_entries INTEGER NOT NULL CHECK(imported_entries >= 0)
+                );
                 PRAGMA user_version = 1;",
                 )
                 .context("failed to create pending-upload schema")?;
@@ -337,6 +353,8 @@ impl PendingUploadStore {
             output_dir,
             _database_file: Arc::new(database_file),
         };
+        let legacy_path = store.data_dir.path().join("pending_uploads.json");
+        store.import_legacy_manifest(&legacy_path, after_legacy_commit)?;
         store.validate_receipt_custody()?;
         store.validate_discard_custody()?;
         store.validate_all_entries()?;
