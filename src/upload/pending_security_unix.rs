@@ -1,0 +1,260 @@
+use super::FileSnapshot;
+use anyhow::{bail, Context, Result};
+use std::ffi::{CString, OsStr};
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path};
+
+#[derive(Debug)]
+pub(super) struct Directory {
+    file: File,
+}
+
+impl Directory {
+    pub(super) fn open_or_create(path: &Path, label: &str) -> Result<Self> {
+        let mut current = open_directory_path(Path::new("/"))
+            .context("failed to open filesystem root for private directory traversal")?;
+        for component in path.components() {
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => name,
+                _ => bail!("unsupported private directory component in {path:?}"),
+            };
+            match open_directory_at(current.as_raw_fd(), name) {
+                Ok(next) => current = next,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    mkdir_at(current.as_raw_fd(), name)?;
+                    current = open_directory_at(current.as_raw_fd(), name).with_context(|| {
+                        format!("failed to open newly created {label} directory component {name:?}")
+                    })?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to open {label} directory without symlink traversal {path:?}"
+                        )
+                    });
+                }
+            }
+        }
+        let directory = Self { file: current };
+        directory.secure_directory(label)?;
+        Ok(directory)
+    }
+
+    pub(super) fn open_file(&self, name: &OsStr, writable: bool, label: &str) -> Result<File> {
+        let name = c_string(name)?;
+        let access = if writable {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                access | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open private {label} file {name:?}"));
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn create_file(&self, name: &OsStr, label: &str) -> Result<File> {
+        let name = c_string(name)?;
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to create private {label} file {name:?}"));
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn secure_file(&self, file: &File, label: &str) -> Result<()> {
+        let before = snapshot_fd(file.as_raw_fd(), label)?;
+        if before.owner_id != unsafe { libc::geteuid() } as u64
+            || before.links != 1
+            || before.mode_or_attributes & libc::S_IFMT as u64 != libc::S_IFREG as u64
+        {
+            bail!("{label} is not a private regular file owned by this user");
+        }
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to apply private file permissions");
+        }
+        let after = snapshot_fd(file.as_raw_fd(), label)?;
+        if after.object_id != before.object_id || after.mode_or_attributes & 0o077 != 0 {
+            bail!("{label} file changed while applying private permissions");
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_entry(&self, name: &OsStr, file: &File, label: &str) -> Result<()> {
+        let name = c_string(name)?;
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                status.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to inspect private {label} directory entry"));
+        }
+        let entry = snapshot_stat(unsafe { status.assume_init() });
+        let opened = snapshot_fd(file.as_raw_fd(), label)?;
+        if entry.object_id != opened.object_id
+            || entry.owner_id != opened.owner_id
+            || entry.links != opened.links
+            || entry.mode_or_attributes & libc::S_IFMT as u64 != libc::S_IFREG as u64
+        {
+            bail!("private {label} directory entry changed while opening");
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_file(&self, name: &OsStr) -> std::io::Result<()> {
+        let name = c_string(name).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{error:#}"))
+        })?;
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn sync(&self, _path: &Path) -> Result<()> {
+        self.file
+            .sync_all()
+            .context("failed to synchronize private directory handle")
+    }
+
+    pub(super) fn snapshot(&self) -> Result<FileSnapshot> {
+        snapshot_fd(self.file.as_raw_fd(), "private directory")
+    }
+
+    pub(super) fn snapshot_file(&self, file: &File, label: &str) -> Result<FileSnapshot> {
+        snapshot_fd(file.as_raw_fd(), label)
+    }
+
+    pub(super) fn verify_path(&self, path: &Path, label: &str) -> Result<()> {
+        let path_file = open_directory_path(path).with_context(|| {
+            format!("failed to verify {label} directory path without symlink traversal {path:?}")
+        })?;
+        if snapshot_fd(path_file.as_raw_fd(), label)?.object_id != self.snapshot()?.object_id {
+            bail!("{label} directory path changed after capability acquisition");
+        }
+        Ok(())
+    }
+
+    fn secure_directory(&self, label: &str) -> Result<()> {
+        let before = self.snapshot()?;
+        if before.owner_id != unsafe { libc::geteuid() } as u64
+            || before.mode_or_attributes & libc::S_IFMT as u64 != libc::S_IFDIR as u64
+        {
+            bail!("{label} directory is not owned by this user");
+        }
+        if unsafe { libc::fchmod(self.file.as_raw_fd(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to make {label} directory private"));
+        }
+        let after = self.snapshot()?;
+        if after.object_id != before.object_id || after.mode_or_attributes & 0o077 != 0 {
+            bail!("{label} directory changed while applying private permissions");
+        }
+        Ok(())
+    }
+}
+
+fn open_directory_path(path: &Path) -> std::io::Result<File> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_directory_at(parent: RawFd, name: &OsStr) -> std::io::Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn mkdir_at(parent: RawFd, name: &OsStr) -> Result<()> {
+    let name = c_string(name)?;
+    if unsafe { libc::mkdirat(parent, name.as_ptr(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to create private directory component {name:?}"));
+    }
+    Ok(())
+}
+
+fn c_string(value: &OsStr) -> Result<CString> {
+    CString::new(value.as_bytes()).context("private custody path contains NUL")
+}
+
+fn snapshot_fd(fd: RawFd, label: &str) -> Result<FileSnapshot> {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, status.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to inspect opened {label}"));
+    }
+    Ok(snapshot_stat(unsafe { status.assume_init() }))
+}
+
+#[cfg(target_os = "macos")]
+fn snapshot_stat(status: libc::stat) -> FileSnapshot {
+    FileSnapshot {
+        object_id: (status.st_dev as u64, status.st_ino as u64),
+        owner_id: status.st_uid as u64,
+        links: status.st_nlink as u64,
+        size: status.st_size as u64,
+        modified: (status.st_mtimespec.tv_sec, status.st_mtimespec.tv_nsec),
+        changed: (status.st_ctimespec.tv_sec, status.st_ctimespec.tv_nsec),
+        mode_or_attributes: status.st_mode as u64,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snapshot_stat(status: libc::stat) -> FileSnapshot {
+    FileSnapshot {
+        object_id: (status.st_dev as u64, status.st_ino as u64),
+        owner_id: status.st_uid as u64,
+        links: status.st_nlink as u64,
+        size: status.st_size as u64,
+        modified: (status.st_mtime, status.st_mtime_nsec),
+        changed: (status.st_ctime, status.st_ctime_nsec),
+        mode_or_attributes: status.st_mode as u64,
+    }
+}
