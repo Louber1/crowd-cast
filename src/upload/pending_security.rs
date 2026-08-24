@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(unix)]
 #[path = "pending_security_unix.rs"]
@@ -103,22 +103,65 @@ impl PrivateDirectory {
         self.inner.snapshot_file(file, label)
     }
 
+    pub(crate) fn file_names(&self) -> Result<Vec<OsString>> {
+        let mut names = self.inner.file_names()?;
+        names.sort();
+        Ok(names)
+    }
+
+    pub(crate) fn sqlite_path(&self, name: &OsStr) -> Result<PathBuf> {
+        validate_leaf(name)?;
+        Ok(self.path.join(name))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn process_open_count(&self, file: &File, label: &str) -> Result<usize> {
+        self.inner
+            .process_open_count(self.snapshot_file(file, label)?.object_id)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn require_new_process_open(
+        &self,
+        file: &File,
+        label: &str,
+        prior_count: usize,
+    ) -> Result<()> {
+        if self.process_open_count(file, label)? <= prior_count {
+            bail!("SQLite did not open the held upload state database object");
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, windows))]
+    fn make_test_acl_permissive(&self, file: &File) -> Result<()> {
+        self.inner.make_test_acl_permissive(file)
+    }
+
+    #[cfg(all(test, windows))]
+    fn test_acl_bytes(&self, file: &File) -> Result<Vec<u8>> {
+        self.inner.test_acl_bytes(file)
+    }
+
     pub(crate) fn remove_file_if_matches(
         &self,
         name: &OsStr,
         expected_object_id: (u64, u64),
     ) -> Result<()> {
+        let _cleanup = cleanup_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("private cleanup lock is poisoned"))?;
         validate_leaf(name)?;
         let file = match self.inner.open_file_for_delete(name, "deleted") {
             Ok(file) => file,
             Err(error) if is_not_found(&error) => return Ok(()),
             Err(error) => return Err(error),
         };
-        self.inner.secure_file(&file, "deleted")?;
-        self.verify_entry(name, &file, "deleted")?;
-        if self.snapshot_file(&file, "deleted")?.object_id != expected_object_id {
+        let snapshot = self.inner.validate_private_file(&file, "deleted")?;
+        if snapshot.object_id != expected_object_id {
             bail!("refusing to delete a replacement private file {name:?}");
         }
+        self.verify_entry(name, &file, "deleted")?;
         match self.inner.remove_file(name, &file) {
             Ok(()) => {
                 self.sync()?;
@@ -147,6 +190,14 @@ impl PrivateDirectory {
     pub(crate) fn verify_path(&self, label: &str) -> Result<()> {
         self.inner.verify_path(&self.path, label)
     }
+}
+
+fn cleanup_lock() -> &'static Mutex<()> {
+    // POSIX cannot condition unlinkat on inode identity. This lock serializes collector cleanup in
+    // one process; the held directory lock covers other collector processes on the same object.
+    // A malicious same-UID process that ignores advisory locks remains outside this boundary.
+    static CLEANUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    CLEANUP_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub(crate) fn secure_sqlite_files(
@@ -340,6 +391,201 @@ mod tests {
             .expect_err("a FIFO must fail instead of waiting for a writer");
 
         assert!(format!("{error:#}").contains("not a private regular file"));
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_permissions_are_not_changed_before_identity_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-delete-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let directory = PrivateDirectory::open_or_create(&root, "test").unwrap();
+        let name = OsStr::new("artifact");
+        let original = directory.create_private_file(name, "test").unwrap();
+        let original_id = directory
+            .snapshot_file(&original, "test")
+            .unwrap()
+            .object_id;
+        drop(original);
+        std::fs::rename(root.join(name), root.join("original")).unwrap();
+        std::fs::write(root.join(name), b"replacement").unwrap();
+        std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        directory
+            .remove_file_if_matches(name, original_id)
+            .expect_err("replacement identity must be rejected");
+
+        assert_eq!(
+            std::fs::symlink_metadata(root.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_directory_enumeration_ignores_a_replacement_path() {
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-enumerate-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let directory = PrivateDirectory::open_or_create(&root, "test").unwrap();
+        directory
+            .create_private_file(OsStr::new("held"), "test")
+            .unwrap();
+        let moved = root.with_extension("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("replacement"), b"outside").unwrap();
+
+        assert_eq!(directory.file_names().unwrap(), [OsString::from("held")]);
+
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sqlite_descriptor_attestation_rejects_a_replacement_database() {
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-sqlite-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("parent/state");
+        let directory = PrivateDirectory::open_or_create(&path, "test").unwrap();
+        let database_name = OsStr::new("state.sqlite3");
+        let file = directory
+            .create_private_file(database_name, "test")
+            .unwrap();
+        let before = directory.process_open_count(&file, "test").unwrap();
+        drop(file);
+        let moved = root.join("moved-parent");
+        std::fs::rename(root.join("parent"), &moved).unwrap();
+        std::fs::create_dir(root.join("parent")).unwrap();
+        std::fs::create_dir(root.join("parent/state")).unwrap();
+        let replacement_path = root.join("parent/state/state.sqlite3");
+        std::fs::File::create(&replacement_path).unwrap();
+
+        let _replacement = rusqlite::Connection::open(&replacement_path).unwrap();
+
+        let held = directory
+            .open_private_file(database_name, false, "test")
+            .unwrap();
+        let error = directory
+            .require_new_process_open(&held, "test", before)
+            .expect_err("a replacement SQLite descriptor must not attest the held database");
+        assert!(format!("{error:#}").contains("did not open the held"));
+        directory
+            .verify_path("test")
+            .expect_err("replacement path must fail capability verification");
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn competing_cleanup_waits_for_the_process_global_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-cleanup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let directory = PrivateDirectory::open_or_create(&root, "test").unwrap();
+        let name = OsString::from("artifact");
+        let file = directory.create_private_file(&name, "test").unwrap();
+        let object_id = directory.snapshot_file(&file, "test").unwrap().object_id;
+        drop(file);
+        let guard = cleanup_lock().lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let competing = directory.clone();
+        let handle = std::thread::spawn(move || {
+            sender
+                .send(competing.remove_file_if_matches(&name, object_id))
+                .unwrap();
+        });
+
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        drop(guard);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        handle.join().unwrap();
+
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn competing_directory_custody_is_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-instance-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let directory = PrivateDirectory::open_or_create(&root, "test").unwrap();
+
+        let error = PrivateDirectory::open_or_create(&root, "competing test")
+            .expect_err("one directory object must have only one collector custodian");
+
+        assert!(format!("{error:#}").contains("exclusive custody"));
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_acl_is_not_changed_before_identity_rejection() {
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-delete-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let directory = PrivateDirectory::open_or_create(&root, "test").unwrap();
+        let name = OsStr::new("artifact");
+        let original = directory.create_private_file(name, "test").unwrap();
+        let original_id = directory
+            .snapshot_file(&original, "test")
+            .unwrap()
+            .object_id;
+        drop(original);
+        std::fs::rename(root.join(name), root.join("original")).unwrap();
+        std::fs::write(root.join(name), b"replacement").unwrap();
+        let replacement = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(name))
+            .unwrap();
+        directory.make_test_acl_permissive(&replacement).unwrap();
+        let acl_before = directory.test_acl_bytes(&replacement).unwrap();
+        drop(replacement);
+
+        directory
+            .remove_file_if_matches(name, original_id)
+            .expect_err("replacement identity must be rejected");
+
+        let replacement = std::fs::OpenOptions::new()
+            .read(true)
+            .open(root.join(name))
+            .unwrap();
+        assert_eq!(directory.test_acl_bytes(&replacement).unwrap(), acl_before);
+        drop(replacement);
         drop(directory);
         std::fs::remove_dir_all(root).unwrap();
     }

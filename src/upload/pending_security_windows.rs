@@ -1,30 +1,33 @@
 use super::FileSnapshot;
 use anyhow::{bail, Context, Result};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf};
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, BOOL, BOOLEAN, HANDLE, HLOCAL};
+use windows::Win32::Foundation::{
+    CloseHandle, LocalFree, BOOL, BOOLEAN, ERROR_NO_MORE_FILES, HANDLE, HLOCAL,
+};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SetSecurityInfo, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
-    GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL,
-    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetTokenInformation, TokenUser,
+    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FileBasicInfo, FileDispositionInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    CREATE_NEW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_BASIC_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateDirectoryW, CreateFileW, FileBasicInfo, FileDispositionInfo, FileIdBothDirectoryInfo,
+    FileIdBothDirectoryRestartInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_BOTH_DIR_INFO, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -96,6 +99,16 @@ impl Directory {
         apply_and_verify_owner_acl(file, false)
     }
 
+    pub(super) fn validate_private_file(&self, file: &File, label: &str) -> Result<FileSnapshot> {
+        reject_reparse_handle(file, label, false)?;
+        verify_exact_owner_acl(file, false)?;
+        let snapshot = snapshot_handle(file, label)?;
+        if snapshot.links != 1 {
+            bail!("{label} is not a single-link private regular file");
+        }
+        Ok(snapshot)
+    }
+
     pub(super) fn verify_entry(&self, name: &OsStr, file: &File, label: &str) -> Result<()> {
         self.verify_path(&self.path, label)?;
         let current = open_file_path(&self.path.join(name), false, false, false, None)
@@ -148,6 +161,136 @@ impl Directory {
     pub(super) fn snapshot_file(&self, file: &File, label: &str) -> Result<FileSnapshot> {
         verify_exact_owner_acl(file, false)?;
         snapshot_handle(file, label)
+    }
+
+    pub(super) fn file_names(&self) -> Result<Vec<OsString>> {
+        let mut names = Vec::new();
+        let mut restart = true;
+        loop {
+            let mut buffer = vec![0u8; 64 * 1024];
+            let result = unsafe {
+                GetFileInformationByHandleEx(
+                    raw_handle(&self.file),
+                    if restart {
+                        FileIdBothDirectoryRestartInfo
+                    } else {
+                        FileIdBothDirectoryInfo
+                    },
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                )
+            };
+            match result {
+                Ok(()) => {}
+                Err(error)
+                    if error.code()
+                        == windows::core::HRESULT::from_win32(ERROR_NO_MORE_FILES.0) =>
+                {
+                    break;
+                }
+                Err(error) => {
+                    return Err(error).context("failed to enumerate private directory handle")
+                }
+            }
+            restart = false;
+            let mut offset = 0usize;
+            loop {
+                if offset + std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>() > buffer.len() {
+                    bail!("Windows returned a truncated private directory entry");
+                }
+                let entry =
+                    unsafe { &*(buffer.as_ptr().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>()) };
+                let name_length = entry.FileNameLength as usize;
+                if name_length % 2 != 0
+                    || offset + std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName) + name_length
+                        > buffer.len()
+                {
+                    bail!("Windows returned an invalid private directory entry name");
+                }
+                let name =
+                    unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_length / 2) };
+                if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                    names.push(OsString::from_wide(name));
+                }
+                if entry.NextEntryOffset == 0 {
+                    break;
+                }
+                offset = offset
+                    .checked_add(entry.NextEntryOffset as usize)
+                    .context("Windows private directory entry offset overflowed")?;
+            }
+        }
+        Ok(names)
+    }
+
+    #[cfg(test)]
+    pub(super) fn make_test_acl_permissive(&self, file: &File) -> Result<()> {
+        with_current_user_sid(|sid| {
+            let mut sid_text = PWSTR::null();
+            unsafe { ConvertSidToStringSidW(sid, &mut sid_text) }
+                .context("failed to format test user SID")?;
+            let sid_guard = LocalGuard(HLOCAL(sid_text.0.cast()));
+            let sddl = format!("D:P(A;;FA;;;{})(A;;GR;;;WD)", unsafe {
+                sid_text.to_string()?
+            });
+            drop(sid_guard);
+            let sddl = wide(OsStr::new(&sddl));
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(sddl.as_ptr()),
+                    1,
+                    &mut descriptor,
+                    None,
+                )
+            }
+            .context("failed to construct permissive test DACL")?;
+            let _descriptor = LocalGuard(HLOCAL(descriptor.0));
+            let mut present = BOOL::default();
+            let mut defaulted = BOOL::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+                    .context("failed to read permissive test DACL")?;
+                SetSecurityInfo(
+                    raw_handle(file),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    PSID::default(),
+                    PSID::default(),
+                    Some(dacl),
+                    None,
+                )
+                .ok()
+                .context("failed to apply permissive test DACL")?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_acl_bytes(&self, file: &File) -> Result<Vec<u8>> {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            GetSecurityInfo(
+                raw_handle(file),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            )
+            .ok()
+            .context("failed to read test Windows ACL")?;
+        }
+        let _descriptor = LocalGuard(HLOCAL(descriptor.0));
+        let length = unsafe { GetSecurityDescriptorLength(descriptor) } as usize;
+        if length == 0 {
+            bail!("Windows returned an empty test security descriptor");
+        }
+        Ok(unsafe { std::slice::from_raw_parts(descriptor.0.cast::<u8>(), length) }.to_vec())
     }
 
     pub(super) fn verify_path(&self, path: &Path, label: &str) -> Result<()> {
@@ -210,11 +353,7 @@ fn open_file_path(
         CreateFileW(
             PCWSTR(path.as_ptr()),
             access,
-            if delete {
-                FILE_SHARE_READ | FILE_SHARE_WRITE
-            } else {
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-            },
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             attributes,
             if create_new {
                 CREATE_NEW

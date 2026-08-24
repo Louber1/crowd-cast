@@ -1,9 +1,9 @@
 use super::FileSnapshot;
 use anyhow::{bail, Context, Result};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path};
 
 #[derive(Debug)]
@@ -113,6 +113,18 @@ impl Directory {
         Ok(())
     }
 
+    pub(super) fn validate_private_file(&self, file: &File, label: &str) -> Result<FileSnapshot> {
+        let snapshot = snapshot_fd(file.as_raw_fd(), label)?;
+        if snapshot.owner_id != unsafe { libc::geteuid() } as u64
+            || snapshot.links != 1
+            || snapshot.mode_or_attributes & libc::S_IFMT as u64 != libc::S_IFREG as u64
+            || snapshot.mode_or_attributes & 0o077 != 0
+        {
+            bail!("{label} is not an owner-only regular file owned by this user");
+        }
+        Ok(snapshot)
+    }
+
     pub(super) fn verify_entry(&self, name: &OsStr, file: &File, label: &str) -> Result<()> {
         let name = c_string(name)?;
         let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -169,6 +181,72 @@ impl Directory {
 
     pub(super) fn snapshot_file(&self, file: &File, label: &str) -> Result<FileSnapshot> {
         snapshot_fd(file.as_raw_fd(), label)
+    }
+
+    pub(super) fn file_names(&self) -> Result<Vec<OsString>> {
+        let duplicate = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to duplicate private directory for enumeration");
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(duplicate);
+            }
+            return Err(error).context("failed to enumerate private directory capability");
+        }
+        let mut names = Vec::new();
+        loop {
+            set_errno(0);
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                let error = current_errno();
+                if error != 0 {
+                    unsafe {
+                        libc::closedir(stream);
+                    }
+                    return Err(std::io::Error::from_raw_os_error(error))
+                        .context("failed while enumerating private directory capability");
+                }
+                break;
+            }
+            let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if bytes != b"." && bytes != b".." {
+                names.push(OsString::from_vec(bytes.to_vec()));
+            }
+        }
+        if unsafe { libc::closedir(stream) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to close private directory enumeration");
+        }
+        Ok(names)
+    }
+
+    pub(super) fn process_open_count(&self, expected_object_id: (u64, u64)) -> Result<usize> {
+        #[cfg(target_os = "linux")]
+        let descriptors = Path::new("/proc/self/fd");
+        #[cfg(target_os = "macos")]
+        let descriptors = Path::new("/dev/fd");
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        compile_error!("SQLite custody requires process descriptor attestation on Unix");
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(descriptors)
+            .context("failed to enumerate process descriptors for SQLite attestation")?
+        {
+            let entry = entry.context("failed to read process descriptor entry")?;
+            let Ok(descriptor) = entry.file_name().to_string_lossy().parse::<RawFd>() else {
+                continue;
+            };
+            match snapshot_fd(descriptor, "process descriptor") {
+                Ok(snapshot) if snapshot.object_id == expected_object_id => count += 1,
+                Ok(_) => {}
+                Err(error) if raw_error(&error) == Some(libc::EBADF) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(count)
     }
 
     pub(super) fn verify_path(&self, path: &Path, label: &str) -> Result<()> {
@@ -265,6 +343,37 @@ fn snapshot_fd(fd: RawFd, label: &str) -> Result<FileSnapshot> {
             .with_context(|| format!("failed to inspect opened {label}"));
     }
     Ok(snapshot_stat(unsafe { status.assume_init() }))
+}
+
+fn raw_error(error: &anyhow::Error) -> Option<i32> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+}
+
+#[cfg(target_os = "linux")]
+fn set_errno(value: i32) {
+    unsafe {
+        *libc::__errno_location() = value;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn set_errno(value: i32) {
+    unsafe {
+        *libc::__error() = value;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn current_errno() -> i32 {
+    unsafe { *libc::__error() }
 }
 
 #[cfg(target_os = "macos")]

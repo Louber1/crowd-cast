@@ -177,7 +177,11 @@ impl PendingUploadStore {
         let database_name = OsStr::new("pending_uploads.sqlite3");
         let database_file =
             data_dir.prepare_private_file(database_name, "upload state database")?;
-        let database_path = data_dir.path().join(database_name);
+        let database_path = data_dir.sqlite_path(database_name)?;
+        data_dir.verify_path("upload state")?;
+        #[cfg(unix)]
+        let database_open_count =
+            data_dir.process_open_count(&database_file, "upload state database")?;
         let mut connection = Connection::open_with_flags(
             &database_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -186,6 +190,13 @@ impl PendingUploadStore {
         )
         .with_context(|| format!("failed to open pending-upload database {database_path:?}"))?;
         data_dir.verify_entry(database_name, &database_file, "upload state database")?;
+        data_dir.verify_path("upload state")?;
+        #[cfg(unix)]
+        data_dir.require_new_process_open(
+            &database_file,
+            "upload state database",
+            database_open_count,
+        )?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .context("failed to enable WAL for pending-upload database")?;
@@ -597,19 +608,8 @@ impl PendingUploadStore {
         let directory_before = self.output_dir.snapshot()?;
         let mut inputs = BTreeMap::new();
         let mut videos = BTreeMap::new();
-        for item in std::fs::read_dir(self.output_dir.path())
-            .with_context(|| format!("failed to scan recording directory {:?}", self.output_dir))?
-        {
-            let item = item.context("failed to read recording directory entry")?;
-            if !item
-                .file_type()
-                .context("failed to read recording artifact type")?
-                .is_file()
-            {
-                continue;
-            }
-            let name = item
-                .file_name()
+        for name in self.output_dir.file_names()? {
+            let name = name
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("recording artifact filename is not UTF-8"))?;
             if let Some(chunk_id) = name
@@ -619,7 +619,10 @@ impl PendingUploadStore {
                 if chunk_id.contains("_partial_") {
                     continue;
                 }
-                if inputs.insert(chunk_id.to_string(), item.path()).is_some() {
+                if inputs
+                    .insert(chunk_id.to_string(), self.output_dir.path().join(&name))
+                    .is_some()
+                {
                     bail!("duplicate input artifact for chunk {chunk_id:?}");
                 }
                 continue;
@@ -631,7 +634,10 @@ impl PendingUploadStore {
                 if !matches!(extension, "mp4" | "mov" | "mkv" | "flv" | "ts") {
                     continue;
                 }
-                if videos.insert(chunk_id.to_string(), item.path()).is_some() {
+                if videos
+                    .insert(chunk_id.to_string(), self.output_dir.path().join(&name))
+                    .is_some()
+                {
                     bail!("duplicate video artifact for chunk {chunk_id:?}");
                 }
             }
