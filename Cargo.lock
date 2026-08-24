@@ -1082,6 +1082,7 @@ dependencies = [
  "tracing-oslog",
  "tracing-subscriber",
  "tray-icon",
+ "url",
  "urlencoding",
  "uuid",
  "wayland-client",
