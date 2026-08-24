@@ -163,7 +163,11 @@ fn default_idle_timeout_secs() -> u64 {
 fn default_single_active_app_capture() -> bool {
     // On by default where follow-focus per-app capture exists. On Linux this is mandatory
     // for supported per-app capture rather than a portal-backed multi-source option.
-    cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+    cfg!(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "linux"
+    ))
 }
 
 fn default_mac_multi_monitor_capture() -> bool {

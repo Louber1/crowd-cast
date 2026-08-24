@@ -19,21 +19,21 @@ mod context;
 #[cfg(target_os = "linux")]
 pub(crate) mod focus;
 mod frontmost;
-#[cfg(target_os = "macos")]
-mod mac_geometry;
 #[cfg(target_os = "linux")]
 pub(crate) mod gnome_screencast;
+#[cfg(target_os = "macos")]
+mod mac_geometry;
 #[cfg(target_os = "linux")]
 pub(crate) mod monitor_layout;
 mod recording;
 mod recovery;
 mod sources;
+#[cfg(target_os = "linux")]
+pub(crate) mod wayland_output;
 #[cfg(target_os = "windows")]
 pub(crate) mod win_enum;
 #[cfg(target_os = "windows")]
 mod window_geometry;
-#[cfg(target_os = "linux")]
-pub(crate) mod wayland_output;
 #[cfg(target_os = "linux")]
 pub(crate) mod x11_windows;
 

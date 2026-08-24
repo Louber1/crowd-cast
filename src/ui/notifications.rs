@@ -49,10 +49,7 @@ mod ffi {
         pub fn notifications_show_idle_paused();
         pub fn notifications_show_idle_resumed();
         pub fn notifications_show_update_installing();
-        pub fn notifications_show_update_completed(
-            version: *const c_char,
-            build: *const c_char,
-        );
+        pub fn notifications_show_update_completed(version: *const c_char, build: *const c_char);
         pub fn notifications_show_upload_queue_warning(count: usize);
         pub fn notifications_is_authorized() -> i32;
     }

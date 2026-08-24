@@ -329,7 +329,13 @@ impl Uploader {
 
         let file_name = format!("logs/{}", remote_name);
         let presign = self
-            .request_presigned_url(endpoint, &file_name, version, &user_id, auth_token.as_deref())
+            .request_presigned_url(
+                endpoint,
+                &file_name,
+                version,
+                &user_id,
+                auth_token.as_deref(),
+            )
             .await?;
         debug!("Got pre-signed URL for log file (key: {})", presign.key);
 
@@ -359,7 +365,10 @@ impl Uploader {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
             let preview = &body_text[..body_text.len().min(500)];
-            warn!("Log upload failed for {}: HTTP {} — {}", remote_name, status, preview);
+            warn!(
+                "Log upload failed for {}: HTTP {} — {}",
+                remote_name, status, preview
+            );
             anyhow::bail!("Log upload returned HTTP {}", status);
         }
 

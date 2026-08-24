@@ -242,8 +242,10 @@ unsafe fn load() -> Result<WinSparkle, String> {
     let set_update_check_interval = sym!(FnInt, b"win_sparkle_set_update_check_interval\0");
     let set_can_shutdown_callback =
         sym!(FnSetCanShutdown, b"win_sparkle_set_can_shutdown_callback\0");
-    let set_shutdown_request_callback =
-        sym!(FnSetShutdownReq, b"win_sparkle_set_shutdown_request_callback\0");
+    let set_shutdown_request_callback = sym!(
+        FnSetShutdownReq,
+        b"win_sparkle_set_shutdown_request_callback\0"
+    );
     let set_user_run_installer_callback = sym!(
         FnSetUserRunInstaller,
         b"win_sparkle_set_user_run_installer_callback\0"

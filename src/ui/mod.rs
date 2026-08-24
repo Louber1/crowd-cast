@@ -1,12 +1,12 @@
 //! System tray UI and notifications
 
 pub mod app_selector;
-#[cfg(target_os = "windows")]
-mod aumid_windows;
 /// Shared Ed25519 message construction for the Linux appcast manifest (also `#[path]`-included
 /// by `bin/cc-sign-manifest`). Linux-only; the signer binary compiles it standalone.
 #[cfg(target_os = "linux")]
 pub(crate) mod appcast_sig;
+#[cfg(target_os = "windows")]
+mod aumid_windows;
 pub mod notifications;
 #[cfg(target_os = "linux")]
 pub mod notify_linux;
@@ -22,11 +22,13 @@ mod tray_windows;
 #[cfg(target_os = "linux")]
 pub(crate) mod update_dialog;
 mod updater;
-#[cfg(target_os = "windows")]
-mod updater_windows;
 #[cfg(target_os = "linux")]
 mod updater_linux;
+#[cfg(target_os = "windows")]
+mod updater_windows;
 
+#[cfg(target_os = "windows")]
+pub use notifications::show_capture_stuck_notification;
 pub use notifications::{
     init_notifications, is_authorized as notifications_authorized,
     show_capture_resumed_notification, show_display_change_notification,
@@ -35,8 +37,6 @@ pub use notifications::{
     show_setup_configuring_notification, show_sources_refreshed_notification,
     show_update_completed_notification, show_update_installing_notification, NotificationAction,
 };
-#[cfg(target_os = "windows")]
-pub use notifications::show_capture_stuck_notification;
 pub use tray::*;
 #[cfg(target_os = "linux")]
 pub use tray_linux::request_tray_exit;

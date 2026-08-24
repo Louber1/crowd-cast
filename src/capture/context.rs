@@ -324,7 +324,9 @@ impl CaptureContext {
                 debug!("Monitor-normalized capture canvas: {}x{}", bw, bh);
                 return ((bw, bh), (bw, bh));
             }
-            warn!("Could not enumerate monitors for canvas sizing; falling back to primary display");
+            warn!(
+                "Could not enumerate monitors for canvas sizing; falling back to primary display"
+            );
         }
 
         // Linux single-active per-app mode: the multi-monitor 1080-short-edge envelope, so a
@@ -1839,8 +1841,10 @@ impl CaptureContext {
         // A target the last enumeration could not resolve (UWP frame parent) stays foreground
         // for as long as the user is in that app; back off instead of paying for a guaranteed-
         // miss enumeration every tick.
-        if super::sources::should_skip_unresolvable(&mut self.follow_focus_unresolvable, target_hwnd)
-        {
+        if super::sources::should_skip_unresolvable(
+            &mut self.follow_focus_unresolvable,
+            target_hwnd,
+        ) {
             return;
         }
 
@@ -1849,7 +1853,10 @@ impl CaptureContext {
         let candidates = match super::sources::enumerate_capture_windows() {
             Ok(w) => w,
             Err(e) => {
-                debug!("Follow-focus: window enumeration failed for '{}': {}", app, e);
+                debug!(
+                    "Follow-focus: window enumeration failed for '{}': {}",
+                    app, e
+                );
                 return;
             }
         };
@@ -1925,7 +1932,10 @@ impl CaptureContext {
         }
         let fg = super::window_geometry::foreground_hwnd();
         if let Some(w) = raws.iter().find(|w| w.hwnd == fg) {
-            lines.push(format!("foreground {}", super::win_enum::describe_window(w)));
+            lines.push(format!(
+                "foreground {}",
+                super::win_enum::describe_window(w)
+            ));
         }
         Some(lines.join("; "))
     }
@@ -2060,7 +2070,8 @@ impl CaptureContext {
                             "macOS follow-focus: retargeted '{}' to display {} ({})",
                             app, target.id, target.uuid
                         );
-                        self.last_display_uuid.insert(app.clone(), target.uuid.clone());
+                        self.last_display_uuid
+                            .insert(app.clone(), target.uuid.clone());
                         self.last_monitor_fit = None;
                     }
                     Err(e) => {

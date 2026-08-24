@@ -57,7 +57,9 @@ pub fn run_wizard_gui(config: &mut Config) -> Result<WizardResult> {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = config;
-        anyhow::bail!("Native GUI wizard is not available on this platform. Edit config.toml manually.");
+        anyhow::bail!(
+            "Native GUI wizard is not available on this platform. Edit config.toml manually."
+        );
     }
 }
 
