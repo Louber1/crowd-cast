@@ -1,17 +1,16 @@
 //! Google OAuth PKCE flow for desktop apps.
 //!
 //! Flow: open browser → Google consent → redirect to localhost → exchange code
-//! for tokens → store in auth.json. Tokens are refreshed transparently before
-//! expiry.
+//! for tokens. Tokens are refreshed transparently before expiry.
 
+use super::credential_store::{self, CredentialStore};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
-use tracing::{debug, error, info, warn};
+use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
 
-/// Stored auth state, persisted to auth.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthState {
     pub google_sub: String,
@@ -23,38 +22,97 @@ pub struct AuthState {
     pub token_expiry: String,
 }
 
+impl AuthState {
+    fn validate(&self) -> Result<()> {
+        if self.google_sub.is_empty()
+            || self.email.is_empty()
+            || self.id_token.is_empty()
+            || self.refresh_token.is_empty()
+        {
+            anyhow::bail!("Google OAuth credential is incomplete");
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.token_expiry)
+            .context("Google OAuth credential has an invalid expiry")?;
+        Ok(())
+    }
+}
+
 /// Manages authentication state: login, token refresh, persistence.
 pub struct AuthManager {
-    /// Cached auth state (None if not logged in).
     state: Option<AuthState>,
-    /// Google OAuth client ID (compile-time).
     client_id: String,
-    /// Google OAuth client secret (compile-time, not confidential for desktop apps).
-    client_secret: String,
+    store: Box<dyn CredentialStore>,
+}
+
+pub fn purge_legacy_plaintext() -> Result<()> {
+    AuthManager::remove_legacy_plaintext(&AuthManager::legacy_auth_path()?)
 }
 
 impl AuthManager {
-    /// Create a new AuthManager, loading persisted state if available.
-    pub fn new(client_id: &str, client_secret: &str) -> Self {
-        let state = Self::auth_path()
-            .and_then(|p| std::fs::read_to_string(&p).ok())
-            .and_then(|s| serde_json::from_str::<AuthState>(&s).ok());
+    pub fn new(client_id: &str) -> Result<Self> {
+        purge_legacy_plaintext()?;
+        Self::load(client_id, credential_store::system()?)
+    }
+
+    fn with_store(
+        client_id: &str,
+        store: Box<dyn CredentialStore>,
+        legacy_path: &Path,
+    ) -> Result<Self> {
+        Self::remove_legacy_plaintext(legacy_path)?;
+        Self::load(client_id, store)
+    }
+
+    fn load(client_id: &str, store: Box<dyn CredentialStore>) -> Result<Self> {
+        let state = store
+            .load()?
+            .map(|secret| {
+                let state: AuthState = serde_json::from_slice(&secret)
+                    .context("failed to parse Google OAuth state from credential service")?;
+                state.validate()?;
+                Ok::<AuthState, anyhow::Error>(state)
+            })
+            .transpose()?;
 
         if let Some(ref s) = state {
             info!("Loaded auth state for {}", s.email);
         }
 
-        Self {
+        Ok(Self {
             state,
             client_id: client_id.to_string(),
-            client_secret: client_secret.to_string(),
-        }
+            store,
+        })
     }
 
-    /// Path to auth.json in the data directory.
-    fn auth_path() -> Option<PathBuf> {
+    fn legacy_auth_path() -> Result<PathBuf> {
         directories::ProjectDirs::from("dev", "crowd-cast", "agent")
             .map(|p| p.data_dir().join("auth.json"))
+            .context("could not determine legacy auth file path")
+    }
+
+    fn remove_legacy_plaintext(path: &Path) -> Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                std::fs::remove_file(path).with_context(|| {
+                    format!("failed to remove legacy plaintext auth state at {path:?}")
+                })?;
+                match std::fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => anyhow::bail!("legacy plaintext auth state still exists at {path:?}"),
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to verify removal of legacy auth state at {path:?}")
+                        });
+                    }
+                }
+                warn!("Removed legacy plaintext auth state");
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to inspect legacy auth state at {path:?}")),
+        }
     }
 
     /// Whether the user is authenticated (has a refresh token).
@@ -100,6 +158,7 @@ impl AuthManager {
         // Generate PKCE code verifier + challenge
         let code_verifier = generate_code_verifier();
         let code_challenge = generate_code_challenge(&code_verifier);
+        let oauth_state = generate_code_verifier();
 
         // Bind a localhost listener on a random port
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -116,11 +175,13 @@ impl AuthManager {
              scope=openid%20email%20profile&\
              code_challenge={}&\
              code_challenge_method=S256&\
+             state={}&\
              access_type=offline&\
              prompt=consent",
             urlencoding::encode(&self.client_id),
             urlencoding::encode(&redirect_uri),
             urlencoding::encode(&code_challenge),
+            urlencoding::encode(&oauth_state),
         );
 
         // Open browser
@@ -148,18 +209,12 @@ impl AuthManager {
 
         // Wait for the callback (blocking)
         info!("Waiting for OAuth callback on port {}...", port);
-        let auth_code = Self::wait_for_callback(listener)?;
+        let auth_code = Self::wait_for_callback(listener, &oauth_state)?;
 
         // Exchange authorization code for tokens
         info!("Exchanging authorization code for tokens...");
-        let token_response = Self::exchange_code(
-            &self.client_id,
-            &self.client_secret,
-            &auth_code,
-            &redirect_uri,
-            &code_verifier,
-        )
-        .await?;
+        let token_response =
+            Self::exchange_code(&self.client_id, &auth_code, &redirect_uri, &code_verifier).await?;
 
         // Parse ID token to extract claims
         let claims = decode_id_token_claims(&token_response.id_token)?;
@@ -167,17 +222,17 @@ impl AuthManager {
         let expiry =
             chrono::Utc::now() + chrono::Duration::seconds(token_response.expires_in as i64);
 
+        let refresh_token = token_response
+            .refresh_token
+            .filter(|token| !token.is_empty())
+            .or_else(|| self.state.as_ref().map(|state| state.refresh_token.clone()))
+            .context("Google token response did not include a refresh token")?;
         let auth_state = AuthState {
             google_sub: claims.sub,
             email: claims.email.clone(),
             name: claims.name,
             id_token: token_response.id_token,
-            refresh_token: token_response.refresh_token.unwrap_or_else(|| {
-                self.state
-                    .as_ref()
-                    .map(|s| s.refresh_token.clone())
-                    .unwrap_or_default()
-            }),
+            refresh_token,
             token_expiry: expiry.to_rfc3339(),
         };
 
@@ -196,12 +251,7 @@ impl AuthManager {
         let client = reqwest::Client::new();
         let resp = client
             .post("https://oauth2.googleapis.com/token")
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", &state.refresh_token),
-                ("client_id", &self.client_id),
-                ("client_secret", &self.client_secret),
-            ])
+            .form(&refresh_form(&state.refresh_token, &self.client_id))
             .send()
             .await
             .context("Token refresh request failed")?;
@@ -226,7 +276,7 @@ impl AuthManager {
         let mut new_state = state.clone();
         new_state.id_token = token_resp.id_token;
         new_state.token_expiry = expiry.to_rfc3339();
-        if let Some(rt) = token_resp.refresh_token {
+        if let Some(rt) = token_resp.refresh_token.filter(|token| !token.is_empty()) {
             new_state.refresh_token = rt;
         }
 
@@ -237,40 +287,21 @@ impl AuthManager {
         Ok(())
     }
 
-    /// Log out: delete auth.json and clear state.
-    pub fn logout(&mut self) {
-        if let Some(path) = Self::auth_path() {
-            let _ = std::fs::remove_file(&path);
-        }
+    pub fn logout(&mut self) -> Result<()> {
+        self.store.delete()?;
         self.state = None;
         info!("Logged out");
+        Ok(())
     }
 
-    /// Save auth state to disk.
     fn save(&self, state: &AuthState) -> Result<()> {
-        let Some(path) = Self::auth_path() else {
-            anyhow::bail!("Could not determine auth file path");
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let json = serde_json::to_string_pretty(state)?;
-        std::fs::write(&path, json)
-            .with_context(|| format!("Failed to write auth state to {:?}", path))?;
-
-        // Set file permissions to owner-only on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-
-        Ok(())
+        state.validate()?;
+        self.store.save(&serde_json::to_vec(state)?)
     }
 
     /// Wait for the OAuth callback on the localhost listener.
     /// Returns the authorization code from the query string.
-    fn wait_for_callback(listener: TcpListener) -> Result<String> {
+    fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
         // Set a timeout so we don't block forever
         listener.set_nonblocking(false)?;
 
@@ -286,8 +317,7 @@ impl AuthManager {
         let first_line = request.lines().next().unwrap_or("");
         let path = first_line.split_whitespace().nth(1).unwrap_or("");
 
-        let code =
-            extract_query_param(path, "code").context("No 'code' parameter in OAuth callback")?;
+        let code = parse_callback(path, expected_state)?;
 
         // Send a success page to the browser: a black-and-white confirmation card
         // matching pdoom.org's styling, with opt-in links onward (dashboard, docs)
@@ -361,7 +391,6 @@ impl AuthManager {
     /// Exchange the authorization code for tokens.
     async fn exchange_code(
         client_id: &str,
-        client_secret: &str,
         code: &str,
         redirect_uri: &str,
         code_verifier: &str,
@@ -369,14 +398,12 @@ impl AuthManager {
         let client = reqwest::Client::new();
         let resp = client
             .post("https://oauth2.googleapis.com/token")
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", redirect_uri),
-                ("client_id", client_id),
-                ("client_secret", client_secret),
-                ("code_verifier", code_verifier),
-            ])
+            .form(&authorization_code_form(
+                client_id,
+                code,
+                redirect_uri,
+                code_verifier,
+            ))
             .send()
             .await
             .context("Token exchange request failed")?;
@@ -456,6 +483,29 @@ fn generate_code_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
 }
 
+fn authorization_code_form<'a>(
+    client_id: &'a str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+) -> [(&'static str, &'a str); 5] {
+    [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", client_id),
+        ("code_verifier", code_verifier),
+    ]
+}
+
+fn refresh_form<'a>(refresh_token: &'a str, client_id: &'a str) -> [(&'static str, &'a str); 3] {
+    [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // URL query parsing
 // ---------------------------------------------------------------------------
@@ -466,16 +516,79 @@ fn extract_query_param(path: &str, param: &str) -> Option<String> {
         let mut kv = pair.splitn(2, '=');
         if let (Some(key), Some(value)) = (kv.next(), kv.next()) {
             if key == param {
-                return Some(urlencoding::decode(value).unwrap_or_default().into_owned());
+                return urlencoding::decode(value)
+                    .ok()
+                    .map(|value| value.into_owned());
             }
         }
     }
     None
 }
 
+fn parse_callback(path: &str, expected_state: &str) -> Result<String> {
+    let state = extract_query_param(path, "state").context("OAuth callback omitted state")?;
+    if state != expected_state {
+        anyhow::bail!("OAuth callback state did not match this login attempt");
+    }
+    if let Some(error) = extract_query_param(path, "error") {
+        anyhow::bail!("Google OAuth authorization failed: {error}");
+    }
+    extract_query_param(path, "code").context("OAuth callback omitted authorization code")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct TestStore {
+        secret: Arc<Mutex<Option<Vec<u8>>>>,
+        fail_delete: bool,
+    }
+
+    impl CredentialStore for TestStore {
+        fn load(&self) -> Result<Option<Vec<u8>>> {
+            Ok(self.secret.lock().unwrap().clone())
+        }
+
+        fn save(&self, secret: &[u8]) -> Result<()> {
+            *self.secret.lock().unwrap() = Some(secret.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self) -> Result<()> {
+            if self.fail_delete {
+                anyhow::bail!("delete denied");
+            }
+            *self.secret.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    fn test_store(secret: Arc<Mutex<Option<Vec<u8>>>>) -> Box<dyn CredentialStore> {
+        Box::new(TestStore {
+            secret,
+            fail_delete: false,
+        })
+    }
+
+    fn sample_state() -> AuthState {
+        AuthState {
+            google_sub: "subject".to_string(),
+            email: "test@example.com".to_string(),
+            name: "Test User".to_string(),
+            id_token: "header.payload.signature".to_string(),
+            refresh_token: "refresh".to_string(),
+            token_expiry: "2030-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn temp_auth_path() -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("crowd-cast-auth-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        root.join("auth.json")
+    }
 
     #[test]
     fn test_pkce_challenge() {
@@ -500,6 +613,110 @@ mod tests {
         );
         assert_eq!(extract_query_param("/?code=abc123", "missing"), None);
         assert_eq!(extract_query_param("/noquery", "code"), None);
+    }
+
+    #[test]
+    fn callback_requires_the_login_attempt_state() {
+        assert_eq!(
+            parse_callback("/?code=abc123&state=expected", "expected").unwrap(),
+            "abc123"
+        );
+        assert!(parse_callback("/?code=abc123&state=other", "expected").is_err());
+        assert!(parse_callback("/?code=abc123", "expected").is_err());
+        assert!(parse_callback("/?error=access_denied&state=expected", "expected").is_err());
+    }
+
+    #[test]
+    fn token_requests_are_public_client_requests() {
+        let exchange = authorization_code_form("client", "code", "redirect", "verifier");
+        assert_eq!(
+            exchange.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            [
+                "grant_type",
+                "code",
+                "redirect_uri",
+                "client_id",
+                "code_verifier"
+            ]
+        );
+        let refresh = refresh_form("refresh", "client");
+        assert_eq!(
+            refresh.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            ["grant_type", "refresh_token", "client_id"]
+        );
+    }
+
+    #[test]
+    fn protected_store_round_trip_has_no_plaintext_file() {
+        let path = temp_auth_path();
+        let secret = Arc::new(Mutex::new(None));
+        let mut manager =
+            AuthManager::with_store("client", test_store(secret.clone()), &path).unwrap();
+        let state = sample_state();
+        manager.save(&state).unwrap();
+        manager.state = Some(state);
+        drop(manager);
+
+        let mut reloaded = AuthManager::with_store("client", test_store(secret), &path).unwrap();
+        assert_eq!(reloaded.email(), Some("test@example.com"));
+        reloaded.logout().unwrap();
+        assert!(!reloaded.is_authenticated());
+        assert!(!path.exists());
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_plaintext_is_removed_before_auth_loads() {
+        let path = temp_auth_path();
+        std::fs::write(&path, b"plaintext bearer tokens").unwrap();
+        let manager =
+            AuthManager::with_store("client", test_store(Arc::new(Mutex::new(None))), &path)
+                .unwrap();
+        assert!(!manager.is_authenticated());
+        assert!(!path.exists());
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_plaintext_removal_failure_is_fatal() {
+        let path = temp_auth_path();
+        std::fs::create_dir(&path).unwrap();
+        let result =
+            AuthManager::with_store("client", test_store(Arc::new(Mutex::new(None))), &path);
+        assert!(result.is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn malformed_protected_state_is_fatal() {
+        let path = temp_auth_path();
+        let result = AuthManager::with_store(
+            "client",
+            test_store(Arc::new(Mutex::new(Some(b"not json".to_vec())))),
+            &path,
+        );
+        assert!(result.is_err());
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_credential_deletion_keeps_authenticated_state() {
+        let path = temp_auth_path();
+        let state = sample_state();
+        let secret = Arc::new(Mutex::new(Some(serde_json::to_vec(&state).unwrap())));
+        let mut manager = AuthManager::with_store(
+            "client",
+            Box::new(TestStore {
+                secret,
+                fail_delete: true,
+            }),
+            &path,
+        )
+        .unwrap();
+        assert!(manager.logout().is_err());
+        assert!(manager.is_authenticated());
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 
     #[test]

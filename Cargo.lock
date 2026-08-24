@@ -1081,6 +1081,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "rusqlite",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",
@@ -1102,6 +1103,7 @@ dependencies = [
  "winapi",
  "windows 0.58.0",
  "x11rb",
+ "zbus",
  "zip 2.4.2",
 ]
 

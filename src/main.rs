@@ -338,6 +338,18 @@ fn main() -> Result<()> {
     // Create tokio runtime for async operations
     let runtime = tokio::runtime::Runtime::new()?;
 
+    auth::purge_legacy_plaintext()?;
+    let auth_manager = match option_env!("CROWD_CAST_GOOGLE_CLIENT_ID") {
+        Some(client_id) => {
+            let mgr = auth::AuthManager::new(client_id)?;
+            if mgr.is_authenticated() {
+                info!("Authenticated as {}", mgr.email().unwrap_or("unknown"));
+            }
+            Some(std::sync::Arc::new(tokio::sync::Mutex::new(mgr)))
+        }
+        None => None,
+    };
+
     // Initialize notifications early (best effort - non-fatal if it fails)
     let (notification_tx, notification_rx) = mpsc::unbounded_channel();
     if let Err(e) = ui::init_notifications(notification_tx) {
@@ -568,16 +580,6 @@ fn main() -> Result<()> {
 
     // Create engine channels
     let (cmd_tx, cmd_rx, status_tx, _status_rx) = create_engine_channels();
-
-    // Initialize optional Google OAuth auth manager
-    let auth_manager = option_env!("CROWD_CAST_GOOGLE_CLIENT_ID").map(|client_id| {
-        let client_secret = option_env!("CROWD_CAST_GOOGLE_CLIENT_SECRET").unwrap_or("");
-        let mgr = auth::AuthManager::new(client_id, client_secret);
-        if mgr.is_authenticated() {
-            info!("Authenticated as {}", mgr.email().unwrap_or("unknown"));
-        }
-        std::sync::Arc::new(tokio::sync::Mutex::new(mgr))
-    });
 
     // Create sync engine
     let engine = SyncEngine::new(

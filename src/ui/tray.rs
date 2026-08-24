@@ -551,10 +551,14 @@ impl TrayApp {
 
         if is_authenticated {
             info!("Signing out...");
-            rt.block_on(async {
+            let result = rt.block_on(async {
                 let mut mgr = auth.lock().await;
-                mgr.logout();
+                mgr.logout()
             });
+            if let Err(error) = result {
+                error!("Sign-out failed: {}", error);
+                return;
+            }
             self.update_auth_display();
             self.refresh_display();
             return;

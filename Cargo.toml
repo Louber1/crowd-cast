@@ -98,6 +98,7 @@ libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "l
 rdev = { git = "https://github.com/p-doom/rdev" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.16", default-features = false, features = ["blocking-api"] }
 # Linux evdev fallback for Wayland
 evdev = "0.12"
 # AT-SPI client for secure-input gating: detects focused password fields so their
@@ -128,6 +129,7 @@ ksni = { version = "0.3", features = ["blocking"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS-specific (for permissions)
 objc = "0.2"
+security-framework = "2.11"
 # Zip extraction for plugin bundles
 zip = "2"
 # Display detection for capture recovery
@@ -142,6 +144,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Console",
