@@ -103,14 +103,27 @@ impl PrivateDirectory {
         self.inner.snapshot_file(file, label)
     }
 
-    pub(crate) fn remove_file_if_present(&self, name: &OsStr) -> Result<()> {
+    pub(crate) fn remove_file_if_matches(
+        &self,
+        name: &OsStr,
+        expected_object_id: (u64, u64),
+    ) -> Result<()> {
         validate_leaf(name)?;
-        match self.inner.remove_file(name) {
+        let file = match self.inner.open_file_for_delete(name, "deleted") {
+            Ok(file) => file,
+            Err(error) if is_not_found(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        self.inner.secure_file(&file, "deleted")?;
+        self.verify_entry(name, &file, "deleted")?;
+        if self.snapshot_file(&file, "deleted")?.object_id != expected_object_id {
+            bail!("refusing to delete a replacement private file {name:?}");
+        }
+        match self.inner.remove_file(name, &file) {
             Ok(()) => {
                 self.sync()?;
                 Ok(())
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error).with_context(|| format!("failed to delete {name:?}")),
         }
     }
@@ -167,7 +180,23 @@ fn normalized_absolute_path(path: &Path) -> Result<PathBuf> {
                 }
             }
             Component::Normal(value) => normalized.push(value),
-            Component::ParentDir | Component::Prefix(_) => {
+            Component::Prefix(prefix) => {
+                #[cfg(windows)]
+                {
+                    if !normalized.as_os_str().is_empty()
+                        || !matches!(prefix.kind(), std::path::Prefix::Disk(_))
+                    {
+                        bail!("private custody path has an unsupported Windows prefix: {path:?}");
+                    }
+                    normalized.push(prefix.as_os_str());
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = prefix;
+                    bail!("private custody path contains a prefix: {path:?}");
+                }
+            }
+            Component::ParentDir => {
                 bail!("private custody path must not contain parent or prefix traversal: {path:?}")
             }
         }
@@ -264,5 +293,72 @@ mod tests {
         assert!(format!("{error:#}").contains("changed after capability acquisition"));
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_swap_back_to_the_held_directory_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-parent-swap-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("parent/held");
+        let directory = PrivateDirectory::open_or_create(&path, "test").unwrap();
+        let moved = root.join("moved-parent");
+        std::fs::rename(root.join("parent"), &moved).unwrap();
+        symlink(&moved, root.join("parent")).unwrap();
+
+        let error = directory
+            .verify_path("test")
+            .expect_err("a swapped intermediate symlink must be rejected");
+
+        assert!(format!("{error:#}").contains("without symlink traversal"));
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_file_is_rejected_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-fifo-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let directory = PrivateDirectory::open_or_create(&root, "test").unwrap();
+        let fifo = root.join("pipe");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        let error = directory
+            .open_private_file(OsStr::new("pipe"), false, "test")
+            .expect_err("a FIFO must fail instead of waiting for a writer");
+
+        assert!(format!("{error:#}").contains("not a private regular file"));
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_component_cannot_be_renamed_during_custody() {
+        let root = std::env::temp_dir().join(format!(
+            "crowd-cast-private-component-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let parent = root.join("parent");
+        let directory = PrivateDirectory::open_or_create(&parent.join("held"), "test").unwrap();
+
+        std::fs::rename(&parent, root.join("moved"))
+            .expect_err("held Windows component must deny rename/delete sharing");
+
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

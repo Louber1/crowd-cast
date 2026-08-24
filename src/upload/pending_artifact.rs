@@ -11,6 +11,7 @@ pub(crate) struct ArtifactSeal {
     directory: PrivateDirectory,
     name: OsString,
     pub(crate) path: PathBuf,
+    pub(crate) object_id: String,
     pub(crate) size_bytes: u64,
     pub(crate) sha256: String,
 }
@@ -19,6 +20,7 @@ impl ArtifactSeal {
     pub(super) fn from_stored(
         directory: &PrivateDirectory,
         path: PathBuf,
+        object_id: String,
         size_bytes: u64,
         sha256: String,
     ) -> Result<Self> {
@@ -29,10 +31,12 @@ impl ArtifactSeal {
             .file_name()
             .context("stored artifact has no filename")?
             .to_os_string();
+        parse_object_id(&object_id)?;
         Ok(Self {
             directory: directory.clone(),
             name,
             path,
+            object_id,
             size_bytes,
             sha256,
         })
@@ -80,6 +84,7 @@ impl ArtifactSeal {
             directory: directory.clone(),
             name: name.to_os_string(),
             path: directory.path().join(name),
+            object_id: encode_object_id(before.object_id),
             size_bytes: copied,
             sha256: digest,
         })
@@ -98,8 +103,11 @@ impl ArtifactSeal {
     pub(crate) fn verify_open_file(&self, file: &mut File, role: &str) -> Result<()> {
         self.directory.verify_entry(&self.name, file, role)?;
         let before = self.directory.snapshot_file(file, role)?;
-        if before.size != self.size_bytes {
-            bail!("pending {role} artifact size changed: {:?}", self.path);
+        if before.object_id != parse_object_id(&self.object_id)? || before.size != self.size_bytes {
+            bail!(
+                "pending {role} artifact identity or size changed: {:?}",
+                self.path
+            );
         }
         file.seek(SeekFrom::Start(0))
             .with_context(|| format!("failed to seek pending {role} artifact {:?}", self.path))?;
@@ -122,8 +130,26 @@ impl ArtifactSeal {
     }
 
     pub(crate) fn remove_if_present(&self) -> Result<()> {
-        self.directory.remove_file_if_present(&self.name)
+        self.directory
+            .remove_file_if_matches(&self.name, parse_object_id(&self.object_id)?)
     }
+}
+
+fn encode_object_id(value: (u64, u64)) -> String {
+    format!("{:016x}:{:016x}", value.0, value.1)
+}
+
+fn parse_object_id(value: &str) -> Result<(u64, u64)> {
+    let (first, second) = value
+        .split_once(':')
+        .context("stored artifact object ID has no separator")?;
+    if first.len() != 16 || second.len() != 16 {
+        bail!("stored artifact object ID has the wrong length");
+    }
+    Ok((
+        u64::from_str_radix(first, 16).context("stored artifact object ID is invalid")?,
+        u64::from_str_radix(second, 16).context("stored artifact object ID is invalid")?,
+    ))
 }
 
 fn hash_file(file: &mut File, role: &str) -> Result<(u64, String)> {
@@ -235,5 +261,24 @@ mod tests {
 
         let text = format!("{error:#}");
         assert!(text.contains("changed while hashing") || text.contains("entry changed"));
+    }
+
+    #[test]
+    fn cleanup_refuses_to_delete_a_replacement() {
+        let paths = TestPaths::new("replacement-delete");
+        let name = OsStr::new("recording_session_seg0000.mp4");
+        paths.write(name.to_str().unwrap(), b"sealed");
+        let seal = ArtifactSeal::seal(&paths.output, name, "video", true).unwrap();
+        let original = paths.output.path().join("original.mp4");
+        std::fs::rename(&seal.path, &original).unwrap();
+        paths.write(name.to_str().unwrap(), b"replacement");
+
+        let error = seal
+            .remove_if_present()
+            .expect_err("cleanup must retain an unknown replacement");
+
+        assert!(format!("{error:#}").contains("refusing to delete a replacement"));
+        assert_eq!(std::fs::read(&seal.path).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(original).unwrap(), b"sealed");
     }
 }

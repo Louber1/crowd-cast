@@ -32,11 +32,13 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 pub(super) struct Directory {
     file: File,
     path: PathBuf,
+    _component_guards: Vec<File>,
 }
 
 impl Directory {
     pub(super) fn open_or_create(path: &Path, label: &str) -> Result<Self> {
         let mut current = PathBuf::new();
+        let mut component_guards = Vec::new();
         for component in path.components() {
             match component {
                 Component::Prefix(prefix) => current.push(prefix.as_os_str()),
@@ -44,11 +46,16 @@ impl Directory {
                 Component::CurDir => {}
                 Component::Normal(name) => {
                     current.push(name);
-                    match open_directory_path(&current, false) {
-                        Ok(file) => reject_reparse_handle(&file, label, true)?,
-                        Err(error) if is_not_found(&error) => create_directory(&current)?,
+                    let file = match open_directory_path(&current, false) {
+                        Ok(file) => file,
+                        Err(error) if is_not_found(&error) => {
+                            create_directory(&current)?;
+                            open_directory_path(&current, false)?
+                        }
                         Err(error) => return Err(error),
-                    }
+                    };
+                    reject_reparse_handle(&file, label, true)?;
+                    component_guards.push(file);
                 }
                 Component::ParentDir => bail!("private directory path contains parent traversal"),
             }
@@ -61,12 +68,13 @@ impl Directory {
         Ok(Self {
             file,
             path: path.to_path_buf(),
+            _component_guards: component_guards,
         })
     }
 
     pub(super) fn open_file(&self, name: &OsStr, writable: bool, label: &str) -> Result<File> {
         self.verify_path(&self.path, label)?;
-        let file = open_file_path(&self.path.join(name), writable, false, None)
+        let file = open_file_path(&self.path.join(name), writable, false, false, None)
             .with_context(|| format!("failed to open private {label} file {name:?}"))?;
         reject_reparse_handle(&file, label, false)?;
         self.verify_path(&self.path, label)?;
@@ -76,7 +84,7 @@ impl Directory {
     pub(super) fn create_file(&self, name: &OsStr, label: &str) -> Result<File> {
         self.verify_path(&self.path, label)?;
         let file = with_owner_descriptor(false, |attributes| {
-            open_file_path(&self.path.join(name), true, true, Some(attributes))
+            open_file_path(&self.path.join(name), true, false, true, Some(attributes))
         })
         .with_context(|| format!("failed to create private {label} file {name:?}"))?;
         reject_reparse_handle(&file, label, false)?;
@@ -90,7 +98,7 @@ impl Directory {
 
     pub(super) fn verify_entry(&self, name: &OsStr, file: &File, label: &str) -> Result<()> {
         self.verify_path(&self.path, label)?;
-        let current = open_file_path(&self.path.join(name), false, false, None)
+        let current = open_file_path(&self.path.join(name), false, false, false, None)
             .with_context(|| format!("failed to verify private {label} file {name:?}"))?;
         reject_reparse_handle(&current, label, false)?;
         if snapshot_handle(&current, label)?.object_id != snapshot_handle(file, label)?.object_id {
@@ -100,10 +108,18 @@ impl Directory {
         Ok(())
     }
 
-    pub(super) fn remove_file(&self, name: &OsStr) -> std::io::Result<()> {
-        let file = self
-            .open_file(name, true, "deleted")
-            .map_err(|error| io_error(&error))?;
+    pub(super) fn open_file_for_delete(&self, name: &OsStr, label: &str) -> Result<File> {
+        self.verify_path(&self.path, label)?;
+        let file =
+            open_file_path(&self.path.join(name), false, true, false, None).with_context(|| {
+                format!("failed to open private {label} file for deletion {name:?}")
+            })?;
+        reject_reparse_handle(&file, label, false)?;
+        self.verify_path(&self.path, label)?;
+        Ok(file)
+    }
+
+    pub(super) fn remove_file(&self, _name: &OsStr, file: &File) -> std::io::Result<()> {
         let disposition = FILE_DISPOSITION_INFO {
             DeleteFile: BOOLEAN(1),
         };
@@ -164,7 +180,7 @@ fn open_directory_path(path: &Path, writable: bool) -> Result<File> {
         CreateFileW(
             PCWSTR(path.as_ptr()),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -178,19 +194,27 @@ fn open_directory_path(path: &Path, writable: bool) -> Result<File> {
 fn open_file_path(
     path: &Path,
     writable: bool,
+    delete: bool,
     create_new: bool,
     attributes: Option<*const SECURITY_ATTRIBUTES>,
 ) -> Result<File> {
-    let mut access = FILE_GENERIC_READ.0 | DELETE.0;
+    let mut access = FILE_GENERIC_READ.0;
     if writable {
         access |= FILE_GENERIC_WRITE.0;
+    }
+    if delete {
+        access |= DELETE.0;
     }
     let path = wide(path.as_os_str());
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            if delete {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+            } else {
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            },
             attributes,
             if create_new {
                 CREATE_NEW
@@ -430,14 +454,6 @@ fn is_not_found(error: &anyhow::Error) -> bool {
                 || cause.code() == windows::core::HRESULT::from_win32(3)
         });
     io_missing || windows_missing
-}
-
-fn io_error(error: &anyhow::Error) -> std::io::Error {
-    if is_not_found(error) {
-        std::io::Error::new(std::io::ErrorKind::NotFound, format!("{error:#}"))
-    } else {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("{error:#}"))
-    }
 }
 
 struct HandleGuard(HANDLE);

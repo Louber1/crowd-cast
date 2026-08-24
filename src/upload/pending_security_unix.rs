@@ -38,6 +38,11 @@ impl Directory {
                 }
             }
         }
+        if unsafe { libc::flock(current.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("failed to lock {label} directory for exclusive custody")
+            });
+        }
         let directory = Self { file: current };
         directory.secure_directory(label)?;
         Ok(directory)
@@ -54,7 +59,7 @@ impl Directory {
             libc::openat(
                 self.file.as_raw_fd(),
                 name.as_ptr(),
-                access | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                access | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -97,6 +102,14 @@ impl Directory {
         if after.object_id != before.object_id || after.mode_or_attributes & 0o077 != 0 {
             bail!("{label} file changed while applying private permissions");
         }
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) }
+                != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to clear nonblocking mode on private regular file");
+        }
         Ok(())
     }
 
@@ -127,7 +140,14 @@ impl Directory {
         Ok(())
     }
 
-    pub(super) fn remove_file(&self, name: &OsStr) -> std::io::Result<()> {
+    pub(super) fn open_file_for_delete(&self, name: &OsStr, label: &str) -> Result<File> {
+        self.open_file(name, true, label)
+    }
+
+    pub(super) fn remove_file(&self, name: &OsStr, file: &File) -> std::io::Result<()> {
+        self.verify_entry(name, file, "deleted").map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("{error:#}"))
+        })?;
         let name = c_string(name).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{error:#}"))
         })?;
@@ -152,7 +172,7 @@ impl Directory {
     }
 
     pub(super) fn verify_path(&self, path: &Path, label: &str) -> Result<()> {
-        let path_file = open_directory_path(path).with_context(|| {
+        let path_file = open_existing_directory(path).with_context(|| {
             format!("failed to verify {label} directory path without symlink traversal {path:?}")
         })?;
         if snapshot_fd(path_file.as_raw_fd(), label)?.object_id != self.snapshot()?.object_id {
@@ -178,6 +198,20 @@ impl Directory {
         }
         Ok(())
     }
+}
+
+fn open_existing_directory(path: &Path) -> Result<File> {
+    let mut current = open_directory_path(Path::new("/"))
+        .context("failed to open filesystem root for private directory verification")?;
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            _ => bail!("unsupported private directory component in {path:?}"),
+        };
+        current = open_directory_at(current.as_raw_fd(), name)?;
+    }
+    Ok(current)
 }
 
 fn open_directory_path(path: &Path) -> std::io::Result<File> {
