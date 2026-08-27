@@ -338,4 +338,206 @@ mod tests {
         let got = select_permissive_candidate(&cands, "ugraf", Some(2)).unwrap();
         assert_eq!(got.hwnd, 1);
     }
+
+    // ================================================================================
+    // Additional adversarial tests (independent review pass on PR #141/#142) — realistic
+    // Siemens NX window shapes, encoding hazards, and known selection-heuristic gaps. Run and
+    // passing (verified against a standalone copy of these pure functions, native macOS,
+    // since this module only compiles under `#[cfg(target_os = "windows")]`; see the review
+    // notes for how they were checked against the actual Windows target).
+    // ================================================================================
+
+    /// Full-featured constructor for adversarial scenarios: unlike `win`, exposes ex_style and
+    /// owner_hwnd independently so a test can shape a window exactly like a real
+    /// NX/tool-window/tooltip artifact (owned, WS_EX_TOOLWINDOW-styled, etc).
+    fn win_ex(
+        hwnd: isize,
+        stem: &str,
+        title: &str,
+        w: i32,
+        h: i32,
+        visible: bool,
+        iconic: bool,
+        ex_style: isize,
+        owner_hwnd: isize,
+    ) -> RawWindow {
+        RawWindow {
+            hwnd,
+            pid: 42,
+            title_len: title.chars().count(),
+            title: title.to_string(),
+            class: "c".into(),
+            exe_name: format!("{stem}.exe"),
+            exe_stem: stem.into(),
+            style: 0,
+            ex_style,
+            visible,
+            iconic,
+            owner_hwnd,
+            width: w,
+            height: h,
+        }
+    }
+
+    const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+
+    /// The motivating shape (PDOOM-1274): NX's main frame is untitled in this scenario, an
+    /// untitled owned helper window sits alongside it, and a titled WS_EX_TOOLWINDOW tool
+    /// palette (owned, hidden owner) is what the user is actually working in. The permissive
+    /// resolver must land on the titled tool window, never the untitled ones — style bits
+    /// (WS_EX_TOOLWINDOW, ownership) are NOT among `permissive_bindable`'s gates, only
+    /// title/visibility/size are, so this also proves style is irrelevant to the outcome.
+    #[test]
+    fn nx_realistic_shape_picks_the_titled_tool_window() {
+        let main_frame_untitled = win_ex(1, "ugraf", "", 1920, 1040, true, false, 0, 0);
+        let untitled_owned_helper = win_ex(2, "ugraf", "", 300, 200, true, false, 0, 1);
+        let tool_window = win_ex(3, "ugraf", "Extrude", 640, 480, true, false, WS_EX_TOOLWINDOW, 1);
+        let cands = [main_frame_untitled, untitled_owned_helper, tool_window];
+        let got = select_permissive_candidate(&cands, "ugraf", None).unwrap();
+        assert_eq!(got.hwnd, 3, "only the titled tool window may be selected");
+    }
+
+    /// Tooltips and IME candidate windows are visible, titled, and can be owned — only their
+    /// small size should disqualify them. Spread of realistic tiny sizes, including one pixel
+    /// short of each individual threshold.
+    #[test]
+    fn tooltip_and_ime_popup_sizes_all_excluded() {
+        let shapes = [(40, 20), (300, 40), (159, 200), (200, 119)];
+        for (w, h) in shapes {
+            let popup = win_ex(10, "ugraf", "Tooltip", w, h, true, false, 0, 0);
+            assert!(!permissive_bindable(&popup), "{}x{} should not qualify", w, h);
+        }
+    }
+
+    /// The documented minimum is inclusive (>=): exactly 160x120 must qualify, one pixel
+    /// under on either axis must not.
+    #[test]
+    fn minimum_size_boundary_is_inclusive() {
+        let exact = win_ex(1, "ugraf", "T", 160, 120, true, false, 0, 0);
+        assert!(permissive_bindable(&exact));
+        let short_w = win_ex(2, "ugraf", "T", 159, 120, true, false, 0, 0);
+        assert!(!permissive_bindable(&short_w));
+        let short_h = win_ex(3, "ugraf", "T", 160, 119, true, false, 0, 0);
+        assert!(!permissive_bindable(&short_h));
+    }
+
+    /// A same-exe splash/about/print-preview overlay that happens to be LARGER than the
+    /// window the user is actually working in. `select_permissive_candidate` has no concept
+    /// of "main content" beyond area, so — documented limitation, not a crash — the overlay
+    /// wins when nothing is preferred. Pins the behavior so a change to the heuristic is a
+    /// deliberate, reviewed decision rather than a silent drift.
+    #[test]
+    fn oversized_same_exe_overlay_can_win_over_the_real_work_window() {
+        let real_work_window = win_ex(1, "ugraf", "Assembly1.prt", 1280, 900, true, false, 0, 0);
+        let splash_overlay = win_ex(2, "ugraf", "About Siemens NX", 1920, 1080, true, false, 0, 0);
+        let cands = [real_work_window, splash_overlay];
+        let got = select_permissive_candidate(&cands, "ugraf", None).unwrap();
+        assert_eq!(got.hwnd, 2, "largest-by-area picked the overlay, not the work window — known limitation");
+    }
+
+    /// `select_permissive_candidate` has no window-placement awareness at all — no monitor,
+    /// no virtual desktop. A large window physically on a DIFFERENT monitor than the one the
+    /// user is looking at competes on equal footing with the window under the user's cursor.
+    #[test]
+    fn largest_by_area_has_no_monitor_locality_awareness() {
+        let window_user_is_looking_at = win_ex(1, "ugraf", "Assembly1.prt", 1280, 900, true, false, 0, 0);
+        let window_on_the_other_monitor = win_ex(2, "ugraf", "Reference.prt", 2560, 1440, true, false, 0, 0);
+        let cands = [window_user_is_looking_at, window_on_the_other_monitor];
+        let got = select_permissive_candidate(&cands, "ugraf", None).unwrap();
+        assert_eq!(got.hwnd, 2, "bigger-but-elsewhere wins with no monitor awareness");
+    }
+
+    /// `RawWindow` carries no DWM-cloaked / virtual-desktop flag, so a window parked on a
+    /// different virtual desktop — which `IsWindowVisible` still reports as visible; only DWM
+    /// cloaking hides it — is indistinguishable here from a genuinely on-screen window. The
+    /// strict validator explicitly excludes cloaked windows (`is_window_cloaked` in
+    /// libobs-window-helper); this permissive path has no equivalent check. This test does not
+    /// prove a runtime bug (nothing here can construct a "cloaked" RawWindow); it documents
+    /// that the data model cannot express the distinction, which is itself the gap.
+    #[test]
+    fn visible_flag_alone_cannot_express_dwm_cloaking() {
+        let plausibly_cloaked = win_ex(1, "ugraf", "Extrude", 640, 480, true, false, 0, 0);
+        assert!(
+            permissive_bindable(&plausibly_cloaked),
+            "current data model has no way to exclude a cloaked-but-visible window"
+        );
+    }
+
+    /// Zero and negative rects (e.g. `GetWindowRect` failing on a window destroyed between
+    /// enumeration and this check — TOCTOU) must degrade to "not bindable", never panic or
+    /// flow into the area comparison as a negative/garbage value.
+    #[test]
+    fn zero_and_negative_rects_never_qualify() {
+        let zero = win_ex(1, "ugraf", "T", 0, 0, true, false, 0, 0);
+        let negative = win_ex(2, "ugraf", "T", -100, -100, true, false, 0, 0);
+        let zero_width_only = win_ex(3, "ugraf", "T", 0, 900, true, false, 0, 0);
+        for w in [&zero, &negative, &zero_width_only] {
+            assert!(!permissive_bindable(w));
+        }
+        assert!(select_permissive_candidate(&[zero, negative, zero_width_only], "ugraf", None).is_none());
+    }
+
+    /// Every candidate for the app is present but under-sized: must return None, not panic or
+    /// pick the "least small" one.
+    #[test]
+    fn app_with_only_sub_minimum_windows_yields_none() {
+        let cands = [
+            win_ex(1, "ugraf", "a", 50, 50, true, false, 0, 0),
+            win_ex(2, "ugraf", "b", 100, 90, true, false, 0, 0),
+            win_ex(3, "ugraf", "c", 159, 119, true, false, 0, 0),
+        ];
+        assert!(select_permissive_candidate(&cands, "ugraf", None).is_none());
+        assert!(select_permissive_candidate(&cands, "ugraf", Some(3)).is_none());
+    }
+
+    /// A title that already contains the literal text "#22"/"#3A" must still round-trip:
+    /// encode replaces '#' before ':', so every '#' — including ones that happen to start a
+    /// "#22"/"#3A"-looking sequence — is escaped first, and the decoder (undo "#3A" -> ':'
+    /// then "#22" -> '#', OBS's own order) recovers the exact original.
+    #[test]
+    fn build_obs_id_title_already_containing_encoded_sequences() {
+        let title = "Weird#22Name#3Awith#hashes:and:colons";
+        let id = build_obs_id(title, "c", "e.exe");
+        let first_segment = id.split(':').next().unwrap_or("");
+        assert!(!first_segment.contains(':'), "no raw ':' may survive encoding");
+        let decoded = first_segment.replace("#3A", ":").replace("#22", "#");
+        assert_eq!(decoded, title);
+    }
+
+    /// Unicode/emoji titles (common in localized NX UIs and drawing names) contain no '#' or
+    /// ':' so they must pass through `enc` byte-for-byte, with no panic from multi-byte UTF-8.
+    #[test]
+    fn build_obs_id_unicode_and_emoji_titles_round_trip() {
+        let title = "図面1 🛠 Extrude";
+        let id = build_obs_id(title, "NXToolWnd", "ugraf.exe");
+        assert!(id.starts_with(title));
+        assert_eq!(id, format!("{}:{}:{}", title, "NXToolWnd", "ugraf.exe"));
+    }
+
+    /// A title that is nothing but the two hazard characters: after encoding, the only raw
+    /// ':' characters left in the whole id are the two structural delimiters `build_obs_id`
+    /// itself inserts between title/class/exe.
+    #[test]
+    fn build_obs_id_all_hash_and_colon_title_does_not_collide_with_delimiters() {
+        let title = "#:#:#:#:";
+        let id = build_obs_id(title, "", "x.exe");
+        assert_eq!(id.matches(':').count(), 2, "only the two structural delimiters remain");
+    }
+
+    #[test]
+    fn build_obs_id_empty_class_and_exe_still_produces_a_parseable_three_part_id() {
+        let id = build_obs_id("Extrude", "", "");
+        assert_eq!(id, "Extrude::");
+        assert_eq!(id.split(':').count(), 3);
+    }
+
+    /// Smoke test against pathological field values (max/min hwnd, negative size, non-UTF-8-
+    /// hazard unicode title): must format, never panic.
+    #[test]
+    fn describe_window_never_panics_on_adversarial_fields() {
+        let w = win_ex(isize::MAX, "ugraf", "図面#:🛠", i32::MIN, i32::MAX, false, true, -1, isize::MIN);
+        let s = describe_window(&w);
+        assert!(s.contains("ugraf"));
+        assert!(s.contains("hwnd="));
+    }
 }
