@@ -169,6 +169,55 @@ pub struct MonitorFit {
     pub pos_y: f32,
 }
 
+/// Monitor-capture target for the current foreground window. The device name is the same stable
+/// value used by OBS's `monitor_id` setting; `scale` fits that monitor into the normalized canvas.
+pub struct DisplayTarget {
+    pub device_name: String,
+    pub scale: f32,
+}
+
+fn matching_display_index(
+    monitor: (i32, i32, u32, u32),
+    displays: &[(i32, i32, u32, u32)],
+) -> Option<usize> {
+    displays.iter().position(|display| *display == monitor)
+}
+
+pub fn foreground_display_target() -> Option<DisplayTarget> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return None;
+    }
+    let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if hmon.is_null() {
+        return None;
+    }
+    let mut info = MonitorInfo {
+        cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+        rc_monitor: Rect::ZERO,
+        rc_work: Rect::ZERO,
+        dw_flags: 0,
+    };
+    if unsafe { GetMonitorInfoW(hmon, &mut info) } == 0 {
+        return None;
+    }
+    let rect = info.rc_monitor;
+    let width = (rect.right - rect.left).max(0) as u32;
+    let height = (rect.bottom - rect.top).max(0) as u32;
+    let displays = display_info::DisplayInfo::all().ok()?;
+    let signatures: Vec<_> = displays
+        .iter()
+        .map(|display| (display.x, display.y, display.width, display.height))
+        .collect();
+    let index = matching_display_index((rect.left, rect.top, width, height), &signatures)?;
+    let monitor = &displays[index];
+    let short = width.min(height);
+    (short > 0).then(|| DisplayTarget {
+        device_name: monitor.name.clone(),
+        scale: TARGET_SHORT_EDGE as f32 / short as f32,
+    })
+}
+
 /// Among an app's candidate windows (their pixel sizes, topmost-first in Z-order),
 /// choose the index of the one the capture source is actually rendering.
 ///
@@ -469,5 +518,36 @@ mod select_capture_window_tests {
     fn empty_candidates_return_none() {
         assert_eq!(select_capture_window(&[], Some((100, 100))), None);
         assert_eq!(select_capture_window(&[], None), None);
+    }
+}
+
+#[cfg(test)]
+mod display_target_tests {
+    use super::matching_display_index;
+
+    #[test]
+    fn matches_monitor_by_complete_virtual_desktop_rectangle() {
+        let displays = [
+            (-1920, 0, 1920, 1080),
+            (0, 0, 2560, 1440),
+            (2560, -400, 1080, 1920),
+        ];
+        assert_eq!(
+            matching_display_index((2560, -400, 1080, 1920), &displays),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn same_resolution_monitor_at_another_origin_does_not_match() {
+        let displays = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
+        assert_eq!(
+            matching_display_index((1920, 0, 1920, 1080), &displays),
+            Some(1)
+        );
+        assert_eq!(
+            matching_display_index((-1920, 0, 1920, 1080), &displays),
+            None
+        );
     }
 }

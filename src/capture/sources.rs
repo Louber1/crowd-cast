@@ -19,6 +19,9 @@ use libobs_simple::sources::macos::{
 #[cfg(target_os = "macos")]
 use libobs_wrapper::data::ObsObjectUpdater;
 
+#[cfg(target_os = "windows")]
+use libobs_wrapper::data::ObsData;
+
 #[cfg(target_os = "linux")]
 use libobs_simple::sources::linux::{
     PipeWireDesktopCaptureSourceBuilder, PipeWireScreenCaptureSourceBuilder,
@@ -82,6 +85,10 @@ pub struct ScreenCaptureSource {
     /// next genuine focus change self-corrects it.
     #[cfg(target_os = "windows")]
     bound_hwnd: Option<isize>,
+    /// Windows monitor name currently selected by `monitor_capture`. OBS keys monitor sources by
+    /// this stable device name; retaining it avoids restarting WGC on every focus poll.
+    #[cfg(target_os = "windows")]
+    display_id: Option<String>,
 }
 
 impl ScreenCaptureSource {
@@ -181,6 +188,7 @@ impl ScreenCaptureSource {
             app_id: None,
             // Monitor capture is display-bound, never window-bound; follow-focus never touches it.
             bound_hwnd: None,
+            display_id: primary.map(|monitor| monitor.0.name.clone()),
         })
     }
 
@@ -366,6 +374,7 @@ impl ScreenCaptureSource {
             // Seed the follow-focus dedup key with the window we just bound, so the first poll
             // after creation only re-points if the foreground window is genuinely different.
             bound_hwnd: Some(hwnd),
+            display_id: None,
         })
     }
 
@@ -789,6 +798,49 @@ impl ScreenCaptureSource {
         Ok(())
     }
 
+    /// Re-point a macOS full-display source while preserving its display-capture settings.
+    #[cfg(target_os = "macos")]
+    pub fn update_display_capture(
+        &mut self,
+        display_uuid: &str,
+        capture_audio: bool,
+    ) -> Result<()> {
+        if self.display_uuid.as_deref() == Some(display_uuid) {
+            return Ok(());
+        }
+        ScreenCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
+            .context("Failed to create display source updater")?
+            .set_display_uuid(display_uuid)
+            .set_show_cursor(true)
+            .set_audio_capture(capture_audio)
+            .update()
+            .context("Failed to update display capture target")?;
+        self.display_uuid = Some(display_uuid.to_string());
+        debug!(
+            "Updated display capture '{}' to {}",
+            self.name, display_uuid
+        );
+        Ok(())
+    }
+
+    /// Re-point a Windows monitor-capture source by its OBS/display-info device name.
+    #[cfg(target_os = "windows")]
+    pub fn update_display_capture(&mut self, display_id: &str, _capture_audio: bool) -> Result<()> {
+        if self.display_id.as_deref() == Some(display_id) {
+            return Ok(());
+        }
+        let mut data = ObsData::new(self.source.runtime())
+            .context("Failed to allocate monitor capture settings")?;
+        data.set_string("monitor_id", display_id)
+            .context("Failed to set monitor capture target")?;
+        self.source
+            .update_raw(data)
+            .context("Failed to update monitor capture target")?;
+        self.display_id = Some(display_id.to_string());
+        debug!("Updated monitor capture '{}' to {}", self.name, display_id);
+        Ok(())
+    }
+
     /// Update the display UUID (non-macOS stub)
     #[cfg(not(target_os = "macos"))]
     pub fn update_display_uuid(&mut self, _display_uuid: &str) -> Result<()> {
@@ -1095,7 +1147,11 @@ pub(crate) fn permissive_window_for_app(
     let raws = super::win_enum::raw_toplevel_windows();
     let chosen = super::win_enum::select_permissive_candidate(&raws, bundle_id, preferred)?;
     let obs_id = super::win_enum::build_obs_id(&chosen.title, &chosen.class, &chosen.exe_name);
-    Some((chosen.hwnd, obs_id, super::win_enum::describe_window(chosen)))
+    Some((
+        chosen.hwnd,
+        obs_id,
+        super::win_enum::describe_window(chosen),
+    ))
 }
 
 /// Find a capturable top-level window belonging to the given application (matched by executable
@@ -1307,8 +1363,8 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
 #[cfg(all(test, target_os = "windows"))]
 mod follow_focus_tests {
     use super::{
-        plan_repoint, resolve_watchdog_target, select_window_by_handle,
-        should_skip_unresolvable, UNRESOLVABLE_RETRY_TICKS,
+        plan_repoint, resolve_watchdog_target, select_window_by_handle, should_skip_unresolvable,
+        UNRESOLVABLE_RETRY_TICKS,
     };
 
     // --- plan_repoint: the HWND-keyed dedup / trigger gate ----------------
@@ -1437,7 +1493,10 @@ mod follow_focus_tests {
         // The bound window is gone AND no window of the app is enumerated: nothing to
         // bind. update_application turns this into its "no capturable window" error.
         let candidates = vec![app_candidate(0x3000, "other-app:C:chrome.exe", "chrome")];
-        assert_eq!(resolve_watchdog_target(&candidates, Some(0x2000), "firefox"), None);
+        assert_eq!(
+            resolve_watchdog_target(&candidates, Some(0x2000), "firefox"),
+            None
+        );
     }
 
     #[test]

@@ -144,6 +144,34 @@ pub fn x11_window_rect(window_id: u32) -> Option<(i32, i32, i32, i32)> {
     (w > 0 && h > 0).then_some((trans.dst_x as i32, trans.dst_y as i32, w, h))
 }
 
+/// The RandR monitor containing the focused window (largest overlap), plus the X root size.
+/// Used by full-display follow-focus to crop the existing virtual-desktop XSHM source.
+pub fn focused_monitor_rect() -> Option<((i32, i32, i32, i32), (u32, u32))> {
+    let (conn, screen_num) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.get(screen_num)?.root;
+    let active = net_active_window(&conn, root)?;
+    let window = x11_window_rect(active)?;
+    let monitors = x11_monitor_rects()?;
+    let monitor = monitors[monitor_with_largest_overlap(window, &monitors)?];
+    Some((monitor, x11_screen_size()?))
+}
+
+fn monitor_with_largest_overlap(
+    window: (i32, i32, i32, i32),
+    monitors: &[(i32, i32, i32, i32)],
+) -> Option<usize> {
+    let overlap = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| -> i64 {
+        let x = (a.0 + a.2).min(b.0 + b.2) - a.0.max(b.0);
+        let y = (a.1 + a.3).min(b.1 + b.3) - a.1.max(b.1);
+        x.max(0) as i64 * y.max(0) as i64
+    };
+    monitors
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, monitor)| overlap(window, **monitor))
+        .map(|(index, _)| index)
+}
+
 /// Resolve `app_identity` (a `/proc/comm`) to the decimal window id of the **currently
 /// focused window**, but only if that window still belongs to `app_identity`. Returns `None`
 /// otherwise (focus moved, or the focused window has no PID) — caller leaves the source
@@ -244,5 +272,23 @@ mod tests {
     fn match_is_exact_not_substring() {
         assert!(!focused_belongs_to(Some("firefox-bin"), "firefox"));
         assert!(!focused_belongs_to(Some("fire"), "firefox"));
+    }
+
+    #[test]
+    fn active_monitor_uses_largest_window_overlap() {
+        let monitors = [(0, 0, 1920, 1080), (1920, 0, 2560, 1440)];
+        assert_eq!(
+            monitor_with_largest_overlap((1800, 100, 1000, 800), &monitors),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn active_monitor_handles_negative_desktop_origins() {
+        let monitors = [(-1920, 0, 1920, 1080), (0, 0, 1920, 1080)];
+        assert_eq!(
+            monitor_with_largest_overlap((-1800, 100, 800, 600), &monitors),
+            Some(0)
+        );
     }
 }
