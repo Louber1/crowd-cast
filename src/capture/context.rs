@@ -327,15 +327,12 @@ impl CaptureContext {
             warn!("Could not enumerate monitors for canvas sizing; falling back to primary display");
         }
 
-        // Linux single-active per-app mode, or full-display follow-focus on X11: the multi-monitor
-        // 1080-short-edge envelope, so a window/monitor on any display fits. Wayland display
-        // capture remains portal-selected and uses its negotiated source resolution.
-        // Output equals the normalized envelope; capping it would crush every monitor. Falls
-        // through to display resolution if monitor enumeration fails.
+        // Linux single-active per-app mode: the multi-monitor 1080-short-edge envelope, so a
+        // window on any monitor fits its normalized slot. Output equals the canvas — the
+        // envelope is already normalized; capping it crushes everything (see doc above). Falls through to display resolution
+        // if monitor enumeration fails.
         #[cfg(target_os = "linux")]
-        if self.use_single_active_app_capture()
-            || (self.target_apps.is_empty() && super::x11_windows::is_pure_x11_session())
-        {
+        if self.use_single_active_app_capture() {
             if let Some((w, h)) = super::monitor_layout::capture_canvas_size() {
                 debug!("Multi-monitor capture canvas: {}x{}", w, h);
                 return ((w, h), (w, h));
@@ -833,7 +830,7 @@ impl CaptureContext {
         self.scene = None;
         self.app_scenes.clear();
         self.blank_scene = None;
-        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             self.last_monitor_fit = None;
         }
@@ -1162,11 +1159,7 @@ impl CaptureContext {
         {
             true
         }
-        #[cfg(target_os = "linux")]
-        {
-            super::x11_windows::is_pure_x11_session()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         false
     }
 
@@ -2100,79 +2093,9 @@ impl CaptureContext {
         }
     }
 
-    /// Full-display follow-focus on X11. `xshm_input` captures the entire X root, so select the
-    /// active monitor by cropping that source and scaling it into the fixed normalized canvas.
-    /// Wayland remains portal-selected because another output cannot be silently authorized.
-    #[cfg(target_os = "linux")]
-    pub fn apply_display_follow_focus(&mut self) {
-        use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
-        use libobs_wrapper::graphics::Vec2;
-        use libobs_wrapper::scenes::ObsTransformInfoBuilder;
-
-        if !self.target_apps.is_empty() || !super::x11_windows::is_pure_x11_session() {
-            return;
-        }
-        let Some(((x, y, width, height), (root_width, root_height))) =
-            super::x11_windows::focused_monitor_rect()
-        else {
-            return;
-        };
-        if x < 0 || y < 0 || width <= 0 || height <= 0 {
-            return;
-        }
-        let right = root_width as i64 - x as i64 - width as i64;
-        let bottom = root_height as i64 - y as i64 - height as i64;
-        if right < 0 || bottom < 0 {
-            return;
-        }
-        let scale =
-            super::monitor_layout::TARGET_SHORT_EDGE as f32 / width.min(height).max(1) as f32;
-        let key = (
-            "__display__".to_string(),
-            scale.to_bits(),
-            x as u32,
-            y as u32,
-        );
-        if self.last_monitor_fit.as_ref() == Some(&key) {
-            return;
-        }
-        let Some(scene) = self.scene.as_ref() else {
-            return;
-        };
-        let Some(source) = self.capture_sources.first() else {
-            return;
-        };
-        let Ok(item) = scene.get_scene_item_ptr(source.source()) else {
-            return;
-        };
-        let crop = libobs::obs_sceneitem_crop {
-            left: x,
-            top: y,
-            right: right as i32,
-            bottom: bottom as i32,
-        };
-        let runtime = source.source().runtime();
-        if libobs_wrapper::run_with_obs!(runtime, (item, crop), move || unsafe {
-            libobs::obs_sceneitem_set_crop(item, &crop)
-        })
-        .is_err()
-        {
-            return;
-        }
-        let info = ObsTransformInfoBuilder::new()
-            .set_pos(Vec2::new(0.0, 0.0))
-            .set_scale(Vec2::new(scale, scale))
-            .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
-            .set_bounds_type(ObsBoundsType::None)
-            .build(0, 0);
-        if scene.set_transform_info(source.source(), &info).is_ok() {
-            Self::set_area_scale_filter(scene, source.source());
-            self.last_monitor_fit = Some(key);
-            info!("Display follow-focus switched to X11 monitor {x},{y} {width}x{height}");
-        }
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    /// No-op where full-display follow-focus is not implemented (Linux keeps its portal/X11
+    /// display capture exactly as before).
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn apply_display_follow_focus(&mut self) {}
 
     /// Apply the monitor-level fit to the active app's capture source: scale the
