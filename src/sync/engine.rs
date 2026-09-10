@@ -3756,17 +3756,16 @@ unintended app video."
                     }
 
                     self.poll_frontmost_app().await;
-                    // Full-display mode follows the monitor containing the foreground window,
-                    // using the same fixed-canvas/source-switch model as app recording.
-                    self.capture_ctx.apply_display_follow_focus();
                     // Windows follow-focus: if the foreground window changed to a different
                     // window of the SAME active app, re-point the window_capture source to it
                     // in-place (deduped on HWND). Runs before the monitor fit so the fit derives
                     // geometry from whatever window ends up bound. No-op elsewhere.
                     #[cfg(target_os = "windows")]
                     self.capture_ctx.apply_focused_window_to_active();
-                    // Track the active window's real on-monitor position/scale
-                    // (Windows monitor-level fit; no-op elsewhere).
+                    // Monitor fit + follow-focus for the active source: Windows/Linux place the
+                    // per-app window at its on-monitor position; macOS fits the per-app or the
+                    // full-display source into the canvas and retargets it to the display holding
+                    // the focused window.
                     self.capture_ctx.apply_monitor_fit_to_active();
                     self.check_display_changes().await;
                     self.graduate_upload_buffer();
@@ -3923,7 +3922,12 @@ unintended app video."
             should_capture,
             "Failed to switch active capture source before segment rotation",
         )?;
-        self.capture_ctx.apply_display_follow_focus();
+        // Re-apply the monitor fit before the new segment's first frame. Deduped, so this is a
+        // no-op unless a source was rebuilt (rebuilds clear the fit cache) or focus moved to
+        // another display since the last poll — either way the segment must not open with an
+        // untransformed source.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        self.capture_ctx.apply_monitor_fit_to_active();
 
         // Increment segment index
         self.segment_index += 1;
@@ -4169,7 +4173,11 @@ unintended app video."
             should_capture,
             "Failed to initialize active capture source before recording start",
         )?;
-        self.capture_ctx.apply_display_follow_focus();
+        // Fit the freshly built source before the first frame: a rebuilt display or app source is
+        // pinned to the main display and untransformed until this runs (see
+        // `apply_monitor_fit_to_active`), and the first poll tick is up to a second away.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        self.capture_ctx.apply_monitor_fit_to_active();
 
         // Generate a main session ID (persists across all segments)
         let main_session_id = uuid::Uuid::new_v4().to_string();
