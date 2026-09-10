@@ -486,6 +486,32 @@ fn run_sck_probe(key: &str, display_uuid: Option<&str>) -> SckProbeVerdict {
     sck_probe_verdict(raw)
 }
 
+/// Segment-metadata dimensions, `(display_width/height, output_width/height)`. `source` is the
+/// captured display's raw size, `canvas` the OBS base canvas. With a normalized multi-monitor
+/// envelope the frame IS the canvas and the output equals it: an envelope is already in
+/// 1080-short-edge space, and re-capping a portrait-tall 1920x1920 envelope to 1080x1080 would
+/// describe a video that does not exist (OBS encodes canvas == output on every such path, see
+/// `CaptureContext::canvas_and_output_dimensions`). Without an envelope the raw display is
+/// reported and its output is 1080-capped, matching `calculate_output_dimensions`. An unreadable
+/// canvas (0x0) falls back to the raw display size.
+fn metadata_dimensions(
+    source: (u32, u32),
+    canvas: (u32, u32),
+    normalized_envelope: bool,
+) -> ((u32, u32), (u32, u32)) {
+    let frame = if normalized_envelope && canvas.0 > 0 && canvas.1 > 0 {
+        canvas
+    } else {
+        source
+    };
+    let output = if normalized_envelope {
+        frame
+    } else {
+        crate::capture::calculate_output_dimensions(frame.0, frame.1, 1080)
+    };
+    (frame, output)
+}
+
 #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn restart_history_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "crowd-cast", "agent")
@@ -2900,25 +2926,17 @@ unintended app video."
         // Empty/None off the feature, so this is inert on other platforms / flag off.
         let (active_display, displays) = self.capture_ctx.capture_layout_metadata();
 
-        let (mut dw, mut dh) = self.display_resolution;
-        // When the macOS multi-monitor path is active, the recorded frame is the normalized
-        // envelope CANVAS, not the main display — report the true canvas as display_width/height.
-        let display_capture_uses_canvas = self.capture_ctx.display_capture_uses_canvas_dimensions();
-        if !displays.is_empty() || display_capture_uses_canvas {
-            let (cw, ch) = self.capture_ctx.canvas_dimensions();
-            if cw > 0 && ch > 0 {
-                dw = cw;
-                dh = ch;
-            }
-        }
-        // Multi-monitor app/display follow-focus uses an already-normalized envelope and OBS
-        // intentionally encodes canvas == output. Re-capping metadata to 1080 here would describe
-        // dimensions different from the actual video (especially with portrait displays).
-        let (ow, oh) = if displays.is_empty() && !display_capture_uses_canvas {
-            crate::capture::calculate_output_dimensions(dw, dh, 1080)
-        } else {
-            (dw, dh)
-        };
+        // The recorded frame is the normalized envelope CANVAS whenever a multi-monitor path is
+        // active — per-app follow-focus reports `displays`; full-display follow-focus (macOS with
+        // the flag on, Windows always) reports via `display_capture_uses_canvas_dimensions` —
+        // otherwise the raw main display. See `metadata_dimensions` for the output rule.
+        let normalized_envelope =
+            !displays.is_empty() || self.capture_ctx.display_capture_uses_canvas_dimensions();
+        let ((dw, dh), (ow, oh)) = metadata_dimensions(
+            self.display_resolution,
+            self.capture_ctx.canvas_dimensions(),
+            normalized_envelope,
+        );
         let (sw, sh) = self
             .capture_ctx
             .active_source_dimensions()
@@ -5692,5 +5710,40 @@ mod tests {
         assert_eq!(buffer.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod metadata_dimension_tests {
+    use super::metadata_dimensions;
+
+    #[test]
+    fn raw_display_is_reported_native_and_output_is_capped_to_1080() {
+        // Single 4K display, multi-monitor path off: the frame is the display itself and the
+        // encoder caps it to 1080p, so the metadata must say the same.
+        assert_eq!(
+            metadata_dimensions((3840, 2160), (3840, 2160), false),
+            ((3840, 2160), (1920, 1080))
+        );
+    }
+
+    #[test]
+    fn envelope_is_reported_as_the_canvas_and_never_recapped() {
+        // Landscape + portrait monitors: the envelope is a 1920x1920 square and OBS encodes
+        // exactly that. Capping to 1080 would describe a 1080x1080 video that does not exist.
+        assert_eq!(
+            metadata_dimensions((3840, 2160), (1920, 1920), true),
+            ((1920, 1920), (1920, 1920))
+        );
+    }
+
+    #[test]
+    fn unreadable_canvas_falls_back_to_the_display_size() {
+        // Canvas not yet known (0x0): report the display rather than a zero frame; output still
+        // follows the envelope rule because that is what OBS was configured with.
+        assert_eq!(
+            metadata_dimensions((2560, 1440), (0, 0), true),
+            ((2560, 1440), (2560, 1440))
+        );
     }
 }
