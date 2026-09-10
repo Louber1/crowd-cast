@@ -1979,55 +1979,17 @@ impl CaptureContext {
         None
     }
 
-    /// Full-display follow-focus on Windows. The foreground window identifies the monitor; WGC is
-    /// re-pointed only when its stable monitor device name changes.
+    /// Windows monitor fit + follow-focus for whichever mode is recording: single-active per-app
+    /// mode places the active app's window at its on-monitor position (`apply_app_monitor_fit`);
+    /// full-display mode (no target apps) fits the single monitor source
+    /// (`apply_display_follow_focus`). Safe to call every poll and right after a source rebuild
+    /// (rebuilds clear the fit cache, so the next call re-applies).
     #[cfg(target_os = "windows")]
-    pub fn apply_display_follow_focus(&mut self) {
-        use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
-        use libobs_wrapper::graphics::Vec2;
-        use libobs_wrapper::scenes::ObsTransformInfoBuilder;
-
-        if !self.target_apps.is_empty() {
-            return;
-        }
-        let Some(target) = super::window_geometry::foreground_display_target() else {
-            return;
-        };
-        let Some(source) = self.capture_sources.first_mut() else {
-            return;
-        };
-        if let Err(e) = source.update_display_capture(&target.device_name, false) {
-            debug!("Windows display follow-focus retarget failed: {}", e);
-            return;
-        }
-        let key = (
-            target.device_name.clone(),
-            target.scale.to_bits(),
-            0f32.to_bits(),
-            0f32.to_bits(),
-        );
-        if self.last_monitor_fit.as_ref() == Some(&key) {
-            return;
-        }
-        let info = ObsTransformInfoBuilder::new()
-            .set_pos(Vec2::new(0.0, 0.0))
-            .set_scale(Vec2::new(target.scale, target.scale))
-            .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
-            .set_bounds_type(ObsBoundsType::None)
-            .build(0, 0);
-        let applied = match (self.scene.as_ref(), self.capture_sources.first()) {
-            (Some(scene), Some(source)) => {
-                let ok = scene.set_transform_info(source.source(), &info).is_ok();
-                if ok {
-                    Self::set_area_scale_filter(scene, source.source());
-                }
-                ok
-            }
-            _ => false,
-        };
-        if applied {
-            info!("Display follow-focus switched to {}", target.device_name);
-            self.last_monitor_fit = Some(key);
+    pub fn apply_monitor_fit_to_active(&mut self) {
+        if self.target_apps.is_empty() {
+            self.apply_display_follow_focus();
+        } else {
+            self.apply_app_monitor_fit();
         }
     }
 
@@ -2035,13 +1997,8 @@ impl CaptureContext {
     /// window by its monitor's 1080-shortest-edge factor and place it at its real
     /// on-monitor position. Re-applied each poll so it tracks the window as it
     /// moves/resizes; de-duplicated so an unchanged transform is a no-op.
-    /// Windows-only; macOS has its SCK-specific implementation below.
     #[cfg(target_os = "windows")]
-    pub fn apply_monitor_fit_to_active(&mut self) {
-        use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
-        use libobs_wrapper::graphics::Vec2;
-        use libobs_wrapper::scenes::ObsTransformInfoBuilder;
-
+    fn apply_app_monitor_fit(&mut self) {
         let Some(app) = self.active_capture_app.clone() else {
             return;
         };
@@ -2067,24 +2024,92 @@ impl CaptureContext {
 
         // Explicit transform: no bounds, top-left aligned, scaled by the monitor
         // factor, positioned at the window's real on-monitor offset (in canvas px).
-        let info = ObsTransformInfoBuilder::new()
-            .set_pos(Vec2::new(fit.pos_x, fit.pos_y))
-            .set_scale(Vec2::new(fit.scale, fit.scale))
-            .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
-            .set_bounds_type(ObsBoundsType::None)
-            .build(0, 0);
-
         let applied = {
             let Some((scene, source)) = self.app_scenes.get(&app) else {
                 return;
             };
-            let ok = scene.set_transform_info(source.source(), &info).is_ok();
-            if ok {
-                Self::set_area_scale_filter(scene, source.source());
-            }
-            ok
+            Self::fit_source_to_canvas(scene, source.source(), fit.scale, (fit.pos_x, fit.pos_y))
         };
         if applied {
+            self.last_monitor_fit = Some(key);
+        }
+    }
+
+    /// Windows full-display follow-focus: keep the single `monitor_capture` source on the monitor
+    /// holding the foreground window and fit it into the normalized envelope canvas (which is
+    /// what the Windows canvas is in every mode — `canvas_and_output_dimensions`). WGC is
+    /// re-pointed only when the monitor's stable device name changes (`update_display_capture`
+    /// dedups on it).
+    ///
+    /// No foreground window (login screen, desktop with nothing focused) keeps the current
+    /// placement. Before any fit has landed, that placement is the monitor the source is on (the
+    /// primary at creation), re-derived by device name so the first frame is already fitted
+    /// rather than drawn at native scale until a window takes focus.
+    ///
+    /// Not yet validated on hardware — the Windows follow-monitor ticket does that; this is
+    /// Louis's logic routed through the shared fit helper.
+    #[cfg(target_os = "windows")]
+    fn apply_display_follow_focus(&mut self) {
+        let capture_audio = self.recording_config.enable_audio;
+        let fit_pending = self.last_monitor_fit.is_none();
+        let Some(source) = self.capture_sources.first_mut() else {
+            return; // no display source yet
+        };
+        let previous = source.display_id().map(str::to_string);
+        let target = match super::window_geometry::foreground_display_target() {
+            Some(t) => t,
+            None => {
+                if !fit_pending {
+                    return; // placement kept, transform in place
+                }
+                let current = match previous.as_deref() {
+                    Some(name) => super::window_geometry::display_target_for_device(name),
+                    None => super::window_geometry::primary_display_target(),
+                };
+                match current {
+                    Some(t) => t,
+                    None => return,
+                }
+            }
+        };
+
+        // Retarget when the monitor changed. The fit cache is dropped only after a SUCCESSFUL
+        // retarget: a failed one leaves the source (and its still-correct transform) on the
+        // previous monitor, and the next poll retries.
+        if previous.as_deref() != Some(target.device_name.as_str()) {
+            if let Err(e) = source.update_display_capture(&target.device_name, capture_audio) {
+                debug!("Display follow-focus retarget failed: {}", e);
+                return;
+            }
+            info!(
+                "Display follow-focus: {} -> {} norm={:.3}",
+                previous.as_deref().unwrap_or("(initial)"),
+                target.device_name,
+                target.scale
+            );
+            self.last_monitor_fit = None;
+        }
+
+        let key = (
+            target.device_name.clone(),
+            target.scale.to_bits(),
+            0f32.to_bits(),
+            0f32.to_bits(),
+        );
+        if self.last_monitor_fit.as_ref() == Some(&key) {
+            return;
+        }
+        let applied = match (self.scene.as_ref(), self.capture_sources.first()) {
+            (Some(scene), Some(source)) => {
+                Self::fit_source_to_canvas(scene, source.source(), target.scale, (0.0, 0.0))
+            }
+            _ => false,
+        };
+        if applied {
+            debug!(
+                "Display fit: scale {:.3} pos (0,0) [{}]",
+                target.scale, target.device_name
+            );
             self.last_monitor_fit = Some(key);
         }
     }

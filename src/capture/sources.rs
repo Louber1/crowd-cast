@@ -823,7 +823,16 @@ impl ScreenCaptureSource {
         Ok(())
     }
 
-    /// Re-point a Windows monitor-capture source by its OBS/display-info device name.
+    /// Windows: the monitor device name this `monitor_capture` source currently points at
+    /// (`None` only if no monitor could be enumerated at creation).
+    #[cfg(target_os = "windows")]
+    pub fn display_id(&self) -> Option<&str> {
+        self.display_id.as_deref()
+    }
+
+    /// Re-point a Windows monitor-capture source by its OBS/display-info device name. Deduped on
+    /// the current name, so an unchanged monitor never restarts WGC. `capture_audio` is accepted
+    /// for call-site symmetry with macOS; the Windows monitor source has no audio track.
     #[cfg(target_os = "windows")]
     pub fn update_display_capture(&mut self, display_id: &str, _capture_audio: bool) -> Result<()> {
         if self.display_id.as_deref() == Some(display_id) {

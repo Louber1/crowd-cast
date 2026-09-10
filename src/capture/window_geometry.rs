@@ -169,11 +169,43 @@ pub struct MonitorFit {
     pub pos_y: f32,
 }
 
-/// Monitor-capture target for the current foreground window. The device name is the same stable
-/// value used by OBS's `monitor_id` setting; `scale` fits that monitor into the normalized canvas.
+/// A monitor as a full-display follow-focus target: the stable device name OBS's `monitor_id`
+/// setting keys on (the same value `MonitorCaptureSourceBuilder::set_monitor` writes at source
+/// creation, so retargeting and creation agree), and the scale that fits the monitor into the
+/// normalized canvas (1080 / its short edge).
 pub struct DisplayTarget {
     pub device_name: String,
     pub scale: f32,
+}
+
+fn display_target_for(monitor: &display_info::DisplayInfo) -> Option<DisplayTarget> {
+    let short = monitor.width.min(monitor.height);
+    (short > 0).then(|| DisplayTarget {
+        device_name: monitor.name.clone(),
+        scale: TARGET_SHORT_EDGE as f32 / short as f32,
+    })
+}
+
+/// The primary monitor as a target — where a freshly created display source points
+/// (`ScreenCaptureSource::new_display_capture`), so it is the placement to fit before any
+/// foreground window exists.
+pub fn primary_display_target() -> Option<DisplayTarget> {
+    let displays = display_info::DisplayInfo::all().ok()?;
+    displays
+        .iter()
+        .find(|display| display.is_primary)
+        .or_else(|| displays.first())
+        .and_then(display_target_for)
+}
+
+/// The monitor with this device name as a target — re-derives `scale` for the placement a display
+/// source is already on (used to retry a fit that never landed without moving the source).
+pub fn display_target_for_device(device_name: &str) -> Option<DisplayTarget> {
+    let displays = display_info::DisplayInfo::all().ok()?;
+    displays
+        .iter()
+        .find(|display| display.name == device_name)
+        .and_then(display_target_for)
 }
 
 fn matching_display_index(
@@ -183,6 +215,12 @@ fn matching_display_index(
     displays.iter().position(|display| *display == monitor)
 }
 
+/// The monitor holding the foreground window as a target. The monitor comes from
+/// `MonitorFromWindow` (physical-pixel rect) and is matched to the `display-info` enumeration by
+/// its complete virtual-desktop rectangle, so two same-resolution monitors are told apart by
+/// position. `None` when there is no foreground window (login screen, desktop with nothing
+/// focused) or the rect matches no enumerated display (mid-topology-change) — the caller keeps
+/// its current placement.
 pub fn foreground_display_target() -> Option<DisplayTarget> {
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.is_null() {
@@ -210,12 +248,7 @@ pub fn foreground_display_target() -> Option<DisplayTarget> {
         .map(|display| (display.x, display.y, display.width, display.height))
         .collect();
     let index = matching_display_index((rect.left, rect.top, width, height), &signatures)?;
-    let monitor = &displays[index];
-    let short = width.min(height);
-    (short > 0).then(|| DisplayTarget {
-        device_name: monitor.name.clone(),
-        scale: TARGET_SHORT_EDGE as f32 / short as f32,
-    })
+    display_target_for(&displays[index])
 }
 
 /// Among an app's candidate windows (their pixel sizes, topmost-first in Z-order),
