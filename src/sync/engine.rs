@@ -456,13 +456,19 @@ fn sck_probe_verdict(raw: std::os::raw::c_int) -> SckProbeVerdict {
 }
 
 /// Run the second-opinion probe for `key` (an app bundle id, or the whole display for
-/// `__display__`). Blocks the engine thread for up to ~2.5s — only called at escalation
-/// decisions, which are rare by construction.
+/// `__display__`) on `display_uuid` — the display the recording is currently pointed at (the
+/// per-app and full-display follow-focus paths move it between monitors; `None` = main display,
+/// which is also where a recording sits when the multi-monitor path is off). Probing the same
+/// display the recording captures is what makes the verdict comparable: a fresh stream of a
+/// DIFFERENT monitor seeing content says nothing about a black recording of this one. Blocks the
+/// engine thread for up to ~2.5s — only called at escalation decisions, which are rare by
+/// construction.
 #[cfg(all(target_os = "macos", not(no_tray)))]
-fn run_sck_probe(key: &str) -> SckProbeVerdict {
+fn run_sck_probe(key: &str, display_uuid: Option<&str>) -> SckProbeVerdict {
     extern "C" {
         fn sck_probe_capture(
             bundle_id: *const std::os::raw::c_char,
+            display_uuid: *const std::os::raw::c_char,
             budget_secs: f64,
         ) -> std::os::raw::c_int;
     }
@@ -470,7 +476,13 @@ fn run_sck_probe(key: &str) -> SckProbeVerdict {
         Ok(c) => c,
         Err(_) => return SckProbeVerdict::Unavailable,
     };
-    let raw = unsafe { sck_probe_capture(c_key.as_ptr(), 2.5) };
+    let c_display = match display_uuid.map(std::ffi::CString::new) {
+        Some(Ok(c)) => Some(c),
+        Some(Err(_)) => return SckProbeVerdict::Unavailable,
+        None => None,
+    };
+    let display_ptr = c_display.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    let raw = unsafe { sck_probe_capture(c_key.as_ptr(), display_ptr, 2.5) };
     sck_probe_verdict(raw)
 }
 
@@ -2528,7 +2540,8 @@ unintended app video."
             DeadSourceAction::Alert => {
                 // Same second opinion before bothering a human: if a fresh stream sees the
                 // same black the recording sees, the screen is genuinely black — no popup.
-                match run_sck_probe(&key) {
+                let probe_display = self.capture_ctx.active_display_uuid();
+                match run_sck_probe(&key, probe_display.as_deref()) {
                     SckProbeVerdict::Black => {
                         self.blind_since.remove(&key);
                         self.blind_probe_standdown
@@ -2597,7 +2610,8 @@ unintended app video."
                 // frames at all is the OS-wedge signature — restart once, then the popup's
                 // "restart your Mac" advice is actually right. Probe failure = fail open,
                 // proceed on the timer alone as before.
-                let verdict = run_sck_probe(&key);
+                let probe_display = self.capture_ctx.active_display_uuid();
+                let verdict = run_sck_probe(&key, probe_display.as_deref());
                 info!(
                     "Second-opinion capture probe for '{}': {:?} (recording {:.1}% black)",
                     key,
