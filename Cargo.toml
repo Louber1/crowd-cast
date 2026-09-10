@@ -146,7 +146,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Display enumeration used to create one OBS source per monitor.
+# Monitor enumeration (device names) so full-display follow-focus can re-point the single
+# monitor_capture source at the monitor holding the foreground window.
 display-info = "0.5.7"
 # Pure-Rust system tray + menu (Tauri ecosystem) for the Windows PlatformTray
 tray-icon = "0.19"

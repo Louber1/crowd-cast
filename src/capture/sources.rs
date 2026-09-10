@@ -1147,11 +1147,7 @@ pub(crate) fn permissive_window_for_app(
     let raws = super::win_enum::raw_toplevel_windows();
     let chosen = super::win_enum::select_permissive_candidate(&raws, bundle_id, preferred)?;
     let obs_id = super::win_enum::build_obs_id(&chosen.title, &chosen.class, &chosen.exe_name);
-    Some((
-        chosen.hwnd,
-        obs_id,
-        super::win_enum::describe_window(chosen),
-    ))
+    Some((chosen.hwnd, obs_id, super::win_enum::describe_window(chosen)))
 }
 
 /// Find a capturable top-level window belonging to the given application (matched by executable
@@ -1363,8 +1359,8 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
 #[cfg(all(test, target_os = "windows"))]
 mod follow_focus_tests {
     use super::{
-        plan_repoint, resolve_watchdog_target, select_window_by_handle, should_skip_unresolvable,
-        UNRESOLVABLE_RETRY_TICKS,
+        plan_repoint, resolve_watchdog_target, select_window_by_handle,
+        should_skip_unresolvable, UNRESOLVABLE_RETRY_TICKS,
     };
 
     // --- plan_repoint: the HWND-keyed dedup / trigger gate ----------------
@@ -1493,10 +1489,7 @@ mod follow_focus_tests {
         // The bound window is gone AND no window of the app is enumerated: nothing to
         // bind. update_application turns this into its "no capturable window" error.
         let candidates = vec![app_candidate(0x3000, "other-app:C:chrome.exe", "chrome")];
-        assert_eq!(
-            resolve_watchdog_target(&candidates, Some(0x2000), "firefox"),
-            None
-        );
+        assert_eq!(resolve_watchdog_target(&candidates, Some(0x2000), "firefox"), None);
     }
 
     #[test]
