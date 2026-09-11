@@ -2046,8 +2046,11 @@ impl CaptureContext {
     /// primary at creation), re-derived by device name so the first frame is already fitted
     /// rather than drawn at native scale until a window takes focus.
     ///
-    /// Not yet validated on hardware — the Windows follow-monitor ticket does that; this is
-    /// Louis's logic routed through the shared fit helper.
+    /// Louis's logic routed through the shared fit helper. Validated on hardware (PDOOM-1405):
+    /// 1920x1080 @150% primary + 3440x1440 @100% secondary, canvas 2580x1080 — WGC honours
+    /// `monitor_id` on `update_raw` (the retargeted pixels really change), the foreground
+    /// monitor rect matches the `display-info` enumeration across mixed DPI, and a rotation
+    /// mid-recording opens the next segment already fitted.
     #[cfg(target_os = "windows")]
     fn apply_display_follow_focus(&mut self) {
         let capture_audio = self.recording_config.enable_audio;
